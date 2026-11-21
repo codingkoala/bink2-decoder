@@ -1,7 +1,7 @@
 //! Row/column edge flag lists (SPEC §3.3). Parsed to stay in sync; their meaning is unknown.
 
 use crate::bits::BitReader;
-use crate::error::{Error, Result};
+use crate::error::Result;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Mode {
@@ -56,14 +56,13 @@ pub fn read_edge_flags(br: &mut BitReader, count: usize) -> Result<Vec<bool>> {
             }
             run = run.min(left);
             left -= run;
+            let mut overlong = false;
             if left > 0 {
                 let extra = br.bits(w as u32)? as usize;
-                // SPEC-QUESTION: SPEC §3.3 does not say what happens when `extra` exceeds the
-                // flags left (left would go negative); we treat it as invalid data.
-                if extra > left {
-                    return Err(Error::InvalidData("edge flag run too long"));
-                }
-                left -= extra;
+                // An `extra` larger than what was left is not an error (SPEC §3.3): the whole
+                // run is produced, flags past F[count] are discarded and the loop ends.
+                overlong = extra > left;
+                left = left.saturating_sub(extra);
                 run += extra;
                 mode = if extra == (1 << w) - 1 {
                     Mode::Explicit
@@ -71,10 +70,14 @@ pub fn read_edge_flags(br: &mut BitReader, count: usize) -> Result<Vec<bool>> {
                     Mode::Toggle
                 };
             }
-            for v in &mut f[pos..pos + run] {
+            let end = (pos + run).min(f.len());
+            for v in &mut f[pos..end] {
                 *v = flag;
             }
-            pos += run;
+            pos = end;
+            if overlong {
+                break;
+            }
         }
     }
     Ok(f)
@@ -151,10 +154,16 @@ mod tests {
     }
 
     #[test]
-    fn overlong_run_is_error() {
-        // count 8: run w=4, flag 1, run 6, left 2, extra 15 > 2
-        let d = pack(&["1", "1", "1", "1111"]);
-        let mut br = BitReader::new(&d);
-        assert!(read_edge_flags(&mut br, 8).is_err());
+    fn overlong_run_is_clipped() {
+        // count 8: run w=4, flag 1, run 6, left 2, extra 15 > 2: the run covers F[1..=8], the
+        // rest is discarded and no further bits are read (the trailing "0101" stays unread).
+        let (f, used) = decode(&["1", "1", "1", "1111", "0101"], 8);
+        assert_eq!(f, flags("011111111"));
+        assert_eq!(used, 1 + 1 + 1 + 4);
+        // contrast: a run clipped by min(run, left) reads no extra at all. count 7, literal
+        // group of 5 (left 2), then run w=2, flag 0, run min(4, 2) = 2 -> left 0.
+        let (f, used) = decode(&["1", "0", "1", "1111", "1", "0"], 7);
+        assert_eq!(f, flags("01111100"));
+        assert_eq!(used, 1 + 1 + 1 + 4 + 1 + 1);
     }
 }
