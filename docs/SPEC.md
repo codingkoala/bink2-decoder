@@ -1,6 +1,6 @@
 # Bink 2 video: decoding specification
 
-Status: draft 2 (2026-11-22). Not yet checked against real files.
+Status: draft 3 (2026-11-22). Container checked against two real `KB2n` files; video not yet verified.
 
 This document describes the Bink 2 container (`KB2*`) and video bitstream in enough detail to write a decoder. Numeric constants are in [TABLES.md](TABLES.md).
 
@@ -46,7 +46,7 @@ The video bitstream is read **LSB-first**: the first bit is bit 0 of byte 0, the
 | Offset | Size | Field |
 |---|---|---|
 | 0x00 | 3 | signature `KB2` |
-| 0x03 | 1 | revision letter: `a`, `d`, `f`, `g`, `h`, `i`, `j` or `k` (others unknown) |
+| 0x03 | 1 | revision letter: `a`, `d`, `f`, `g`, `h`, `i`, `j`, `k` (known to the reference), `n` (seen in real files, see below) |
 | 0x04 | 4 | file size − 8 |
 | 0x08 | 4 | number of frames (sanity limit 1,000,000) |
 | 0x0C | 4 | largest frame size in bytes |
@@ -59,11 +59,15 @@ The video bitstream is read **LSB-first**: the first bit is bit 0 of byte 0, the
 | 0x28 | 4 | number of audio tracks N (≤ 256) |
 
 Then, in order:
-1. Revisions `i`, `j`, `k` only: 4 bytes, unknown.
+1. Revisions `i` and later: 4 bytes, unknown.
 2. N × 4 bytes: maximum decoded audio size per track (not needed).
 3. N × 4 bytes: per track, `u16 sample_rate` then `u16 audio flags`. In the audio flags, 0x2000 means stereo (mono otherwise) and 0x1000 means the DCT audio codec (RDFT otherwise). 0x4000 means "16-bit".
 4. N × 4 bytes: audio track ids.
 5. **Frame index:** one `u32` per frame. Bit 0 set means a keyframe; clearing bit 0 gives the absolute file offset of the frame. A frame ends where the next one starts; the last frame ends at the file size (header field + 8). The offsets must be strictly increasing.
+
+**Revision `n`** (not known to the reference). Two real 2560×1440 files show the same container layout as `i`/`j`/`k`: the extra field at 0x2C is present (both files: 0x87E90500), and with no audio the frame index starts at 0x30 and ends exactly where frame 0 starts. Treat `l`, `m` and `n` like `k` (integer variant, §3.2 rule for `h` and later) until a difference shows up. Whether the video bitstream is unchanged is **unverified**; the observed slice tables look consistent (8 slices for `video_flags & 3 = 3`, increasing offsets inside the frame).
+
+The frame index has `frames + 1` entries; the last one is the end of the last frame. Using the file size for that is equivalent.
 
 Video flags:
 - bit 20 (0x00100000): the video has an alpha plane.
