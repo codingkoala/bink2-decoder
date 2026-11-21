@@ -78,8 +78,8 @@ pub(crate) fn decode_slice(
 }
 
 /// Luma coded-block pattern (SPEC §5.2).
-// SPEC-QUESTION: "if bit(): h |= j" for "each set bit j of m" is read as OR-ing the bit itself
-// (1 << index), not its index; the following `h &= m` only makes sense for a mask.
+// Note: `h |=` ORs in the bit's mask (1, 2, 4 or 8), and the initial `nib` and `h` seeds really
+// take nibble 1 of `prev` (SPEC §5.2, draft 2; matches the reference, possibly a reference bug).
 pub(crate) fn read_luma_cbp(br: &mut BitReader, prev: u32) -> Result<u32> {
     let lo = if br.bit()? {
         if br.bit()? {
@@ -331,9 +331,8 @@ fn decode_mb(
     top_edge: bool,
 ) -> Result<()> {
     let left_edge = mbx == 0;
-    // SPEC-QUESTION: SPEC §5.1 says "Block type: bits(2)" without saying whether keyframes
-    // skip it as in §4.2; we assume they do (keyframe => INTRA, no bits), with bits(2) mapping
-    // to the §4.1 numbering (0 INTRA, 1 SKIP, 2 MOTION, 3 RESIDUE).
+    // Keyframes read no type bits and every MB is INTRA; otherwise bits(2) uses the §4.1
+    // numbering (0 INTRA, 1 SKIP, 2 MOTION, 3 RESIDUE) (SPEC §5.1).
     let ty = if ctx.keyframe { INTRA } else { br.bits(2)? as u8 };
     rows.cur[mbx].ty = ty;
     if ty == INTRA {
@@ -379,9 +378,9 @@ fn decode_mb(
             me.mv = predict_mv(&d, top_edge, left_edge, &l.mv, &t.mv, &tl.mv);
             ctx.mc_mb(mbx, mby, &me.mv, &[0, 1, 2])?;
             if ctx.has_alpha {
-                // SPEC-QUESTION: the reference does not motion-compensate alpha in the float
-                // variant (SPEC §5.1, unverified), leaving the block undefined; we copy the
-                // co-located reference alpha so the residual (RESIDUE) has a defined base.
+                // Note: the reference does not motion-compensate alpha in the float variant and
+                // leaves it undefined (SPEC §5.1, unverified). Copying the co-located reference
+                // alpha is the documented stand-in; RESIDUE then adds its alpha residual to it.
                 ctx.copy_mb_plane(3, mbx, mby)?;
             }
             if ty != crate::video::MOTION {

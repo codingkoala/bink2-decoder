@@ -219,8 +219,8 @@ pub(crate) fn read_ac_group(br: &mut BitReader, p: u32, q: i32, qm: &[[i32; 64];
                 v = -v;
             }
             let i = SCAN_G[pos] as usize;
-            // SPEC-QUESTION: with q up to 36 and large levels the product overflows 32 bits;
-            // we compute in 64 bits and wrap to int16 ("stored as int16"), behaviour unverified.
+            // Note: the product can overflow 32 bits only for absurd levels at high q, where
+            // any wrapping is acceptable (SPEC §4.4). We compute in 64 bits and wrap to int16.
             blk[i] = ((((v * m[i] as i64) << shift) + 64) >> 7) as i16;
             pos += 1;
         }

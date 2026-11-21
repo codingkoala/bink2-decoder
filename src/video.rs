@@ -379,6 +379,8 @@ fn mc_block(
     chroma: bool,
     policy: OutOfRangeMv,
 ) {
+    // W and H are the visible picture size, not the 32-aligned size (SPEC §4.7), so even
+    // zero-vector blocks starting in the padding right of or below the picture are outside.
     let outside = sx < 0 || sx >= w || sy < 0 || sy >= h;
     if outside {
         match policy {
