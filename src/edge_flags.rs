@@ -58,6 +58,8 @@ pub fn read_edge_flags(br: &mut BitReader, count: usize) -> Result<Vec<bool>> {
             left -= run;
             if left > 0 {
                 let extra = br.bits(w as u32)? as usize;
+                // SPEC-QUESTION: SPEC §3.3 does not say what happens when `extra` exceeds the
+                // flags left (left would go negative); we treat it as invalid data.
                 if extra > left {
                     return Err(Error::InvalidData("edge flag run too long"));
                 }
