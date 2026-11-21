@@ -67,7 +67,7 @@ pub(crate) fn decode_slice(
             lru: [MOTION, RESIDUE, SKIP, INTRA],
         };
         for mbx in 0..ctx.mb_w {
-            decode_mb(ctx, br, rows, &mut rs, mbx, mby, mby == r0)?;
+            decode_mb(ctx, br, rows, &mut rs, mbx, mby, mby == r0).inspect_err(|_| ctx.fail_mb = Some((mbx, mby)))?;
         }
         std::mem::swap(&mut rows.cur, &mut rows.prev);
     }

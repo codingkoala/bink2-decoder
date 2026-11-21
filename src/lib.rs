@@ -36,7 +36,7 @@ pub mod vlc;
 pub use container::{AudioTrack, Container, FrameEntry, FramePacket, Header};
 pub use error::{Error, Result};
 pub use frame::{VideoFrame, MARGIN};
-pub use video::{slice_boundaries, Decoder, DecoderOptions, OutOfRangeMv};
+pub use video::{slice_boundaries, Decoder, DecoderOptions, OutOfRangeMv, SliceFailure, SliceReport};
 
 #[cfg(test)]
 mod e2e_tests;

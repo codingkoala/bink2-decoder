@@ -34,6 +34,50 @@ pub enum OutOfRangeMv {
 pub struct DecoderOptions {
     /// Out-of-picture motion vector handling.
     pub out_of_range_mv: OutOfRangeMv,
+    /// When a slice fails to decode, conceal the rest of it (copy from the previous frame, or
+    /// mid-grey without one) and carry on with the next slice instead of failing the frame.
+    /// The failure is still recorded in [`Decoder::slice_reports`].
+    pub conceal_slice_errors: bool,
+}
+
+/// Where and why a slice failed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SliceFailure {
+    /// MB column and row (in MB units, frame coordinates) being decoded when the error occurred.
+    pub mb: (usize, usize),
+    /// Bit position in the video packet when the error was returned.
+    pub bit: usize,
+    /// The error.
+    pub error: Error,
+}
+
+/// Bit accounting for one slice of the last decoded packet. Useful to check that the decoder
+/// stays in sync with the stream: a correctly parsed slice ends at (or a few padding bytes
+/// before) `end_byte`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SliceReport {
+    /// Slice number.
+    pub index: usize,
+    /// MB rows `[first, end)`.
+    pub mb_rows: (usize, usize),
+    /// Bit position where the slice data starts (slice 0 starts after the slice table and the
+    /// edge flags, so it need not be byte-aligned).
+    pub start_bit: usize,
+    /// Byte offset where the next slice starts, from the slice table.
+    pub end_byte: usize,
+    /// Bit position after the slice was decoded (before `align()`).
+    pub consumed_bit: usize,
+    /// Set if the slice failed.
+    pub failure: Option<SliceFailure>,
+}
+
+impl SliceReport {
+    /// True if the slice decoded without error and ended within the 0–3 padding bytes before
+    /// `end_byte` (slices are observed to be padded to 4 bytes).
+    pub fn in_sync(&self) -> bool {
+        let end = self.consumed_bit.div_ceil(8);
+        self.failure.is_none() && end <= self.end_byte && self.end_byte - end <= 3
+    }
 }
 
 /// Slice boundaries in luma rows (SPEC §3.2). `boundary[S-1]` is the 32-aligned height.
@@ -299,6 +343,8 @@ pub(crate) struct FrameCtx<'a> {
     pub pic_h: i64,
     pub mb_w: usize,
     pub opts: DecoderOptions,
+    /// Set by the slice decoders to the MB that failed.
+    pub fail_mb: Option<(usize, usize)>,
 }
 
 impl FrameCtx<'_> {
@@ -363,6 +409,28 @@ impl FrameCtx<'_> {
     }
 }
 
+/// Conceals MBs from `from` (inclusive) to the end of MB row `end_row` (exclusive): copies the
+/// co-located MB from the reference, or fills mid-grey without one.
+fn conceal(ctx: &mut FrameCtx, from: (usize, usize), end_row: usize) {
+    let (mut x, mut y) = from;
+    while y < end_row {
+        if ctx.copy_mb(x, y).is_err() {
+            for (p, plane) in ctx.cur.planes.iter_mut().enumerate() {
+                let n = if is_chroma(p) { 16 } else { 32 };
+                for r in 0..n {
+                    let i = plane.idx((n * x) as i64, (n * y + r) as i64);
+                    plane.data[i..i + n].fill(if p == 3 { 255 } else { 128 });
+                }
+            }
+        }
+        x += 1;
+        if x == ctx.mb_w {
+            x = 0;
+            y += 1;
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn mc_block(
     dst: &mut Plane,
@@ -417,6 +485,8 @@ pub struct Decoder {
     opts: DecoderOptions,
     reference: Option<FrameBuf>,
     spare: Option<FrameBuf>,
+    reports: Vec<SliceReport>,
+    last_frame_flags: u32,
 }
 
 impl Decoder {
@@ -444,6 +514,8 @@ impl Decoder {
             opts: DecoderOptions::default(),
             reference: None,
             spare: None,
+            reports: Vec::new(),
+            last_frame_flags: 0,
         })
     }
 
@@ -455,6 +527,16 @@ impl Decoder {
     /// True if the video has an alpha plane.
     pub fn has_alpha(&self) -> bool {
         self.has_alpha
+    }
+
+    /// `frame_flags` of the last packet whose header parsed.
+    pub fn last_frame_flags(&self) -> u32 {
+        self.last_frame_flags
+    }
+
+    /// Per-slice bit accounting of the last [`Decoder::decode`] call.
+    pub fn slice_reports(&self) -> &[SliceReport] {
+        &self.reports
     }
 
     /// Drops the reference frame (e.g. before seeking to a keyframe).
@@ -517,7 +599,9 @@ impl Decoder {
             return Err(Error::MissingReference);
         }
         let mut br = BitReader::new(packet);
+        self.reports.clear();
         let hdr = self.parse_packet_header(packet, &mut br)?;
+        self.last_frame_flags = hdr.frame_flags;
         let mut cur = self
             .spare
             .take()
@@ -533,6 +617,7 @@ impl Decoder {
                 pic_h: self.height as i64,
                 mb_w: self.aligned_w / 32,
                 opts: self.opts,
+                fail_mb: None,
             };
             let float = is_float_revision(self.revision);
             let mut gstate = crate::g::SliceRows::new(ctx.mb_w);
@@ -540,10 +625,31 @@ impl Decoder {
             for (i, &(r0, r1)) in hdr.slice_rows.iter().enumerate() {
                 // SPEC-QUESTION: the reference only warns when a slice over- or under-reads; we
                 // allow reading into the next slice but fail on reading past the packet end.
-                if float {
-                    crate::f::decode_slice(&mut ctx, &mut br, &mut fstate, r0, r1)?;
+                let start_bit = br.position();
+                ctx.fail_mb = None;
+                let res = if float {
+                    crate::f::decode_slice(&mut ctx, &mut br, &mut fstate, r0, r1)
                 } else {
-                    crate::g::decode_slice(&mut ctx, &mut br, &mut gstate, r0, r1)?;
+                    crate::g::decode_slice(&mut ctx, &mut br, &mut gstate, r0, r1)
+                };
+                let failure = res.err().map(|error| SliceFailure {
+                    mb: ctx.fail_mb.unwrap_or((0, r0)),
+                    bit: br.position(),
+                    error,
+                });
+                self.reports.push(SliceReport {
+                    index: i,
+                    mb_rows: (r0, r1),
+                    start_bit,
+                    end_byte: hdr.slice_end[i],
+                    consumed_bit: br.position(),
+                    failure: failure.clone(),
+                });
+                if let Some(f) = failure {
+                    if !self.opts.conceal_slice_errors {
+                        return Err(f.error);
+                    }
+                    conceal(&mut ctx, f.mb, r1);
                 }
                 br.align();
                 br.seek_byte(hdr.slice_end[i])?;

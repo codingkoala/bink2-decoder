@@ -362,3 +362,27 @@ fn fuzz_all_variants_never_panic() {
         }
     }
 }
+
+#[test]
+fn slice_reports_and_concealment() {
+    // Two slices (revision h, 64x64). Slice 0 is valid; slice 1 is a single byte of ones, which
+    // reads dq = 0 then runs out of data inside the MB.
+    let mut w = BitWriter::default();
+    g_flat_intra_mb(&mut w, false);
+    g_flat_intra_mb(&mut w, false);
+    let pkt = packet(0, &[w.finish(), vec![0xFF]]);
+    let mut dec = Decoder::with_params(b'h', 64, 64, 0).unwrap();
+    assert_eq!(dec.decode(&pkt, true).unwrap_err(), Error::Truncated);
+    let r = dec.slice_reports();
+    assert_eq!(r.len(), 2);
+    assert!(r[0].in_sync());
+    assert_eq!(r[1].failure.as_ref().unwrap().mb, (0, 1));
+
+    dec.set_options(crate::DecoderOptions { conceal_slice_errors: true, ..Default::default() });
+    let f = dec.decode(&pkt, true).unwrap();
+    assert!(dec.slice_reports()[0].in_sync());
+    assert!(!dec.slice_reports()[1].in_sync());
+    assert_flat(&f.y[..64 * 32], 128, "decoded slice");
+    assert_flat(&f.y[64 * 32..], 128, "concealed slice (grey, no reference)");
+    assert_eq!(dec.last_frame_flags(), 0);
+}
