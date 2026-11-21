@@ -1,6 +1,6 @@
 # Bink 2 video: decoding specification
 
-Status: draft 1 (2026-11-21). Not yet checked against real files.
+Status: draft 2 (2026-11-22). Not yet checked against real files.
 
 This document describes the Bink 2 container (`KB2*`) and video bitstream in enough detail to write a decoder. Numeric constants are in [TABLES.md](TABLES.md).
 
@@ -51,8 +51,8 @@ The video bitstream is read **LSB-first**: the first bit is bit 0 of byte 0, the
 | 0x08 | 4 | number of frames (sanity limit 1,000,000) |
 | 0x0C | 4 | largest frame size in bytes |
 | 0x10 | 4 | unknown |
-| 0x14 | 4 | width |
-| 0x18 | 4 | height |
+| 0x14 | 4 | width (1 … 7680) |
+| 0x18 | 4 | height (1 … 4800) |
 | 0x1C | 4 | frame rate numerator (non-zero) |
 | 0x20 | 4 | frame rate denominator (non-zero) |
 | 0x24 | 4 | **video flags** (see below) |
@@ -70,7 +70,7 @@ Video flags:
 - bits 0–1: slice count selector for revision `h` and later (§3.2).
 - Other bits: unknown.
 
-Some files are wrapped in 512-byte "SMUS" blocks. The Bink signature then appears at a 512-byte boundary, and every file offset is relative to that position.
+Some files are wrapped in 512-byte "SMUS" blocks: the file starts with the 4 bytes `SMUS`. Step forward in 512-byte units until the first 3 bytes at that position are a Bink signature; that position is the start of the Bink data, and every file offset in the header and index is relative to it. The data from there on is contiguous. The reference only recognises Bink 1 (`BIK`) signatures inside SMUS, so SMUS-wrapped Bink 2 may not exist in practice.
 
 ### 2.2 Frame packets
 
@@ -145,9 +145,11 @@ while left > 0:
         if left > 0:
             extra = bits(w); left -= extra; run += extra
             mode = (extra == 2^w - 1) ? EXPLICIT : TOGGLE
-        F[pos .. pos+run-1] = flag; pos += run
+        F[pos .. pos+run-1] = flag; pos += run   // may run past count, see below
 ```
 `mode` starts as "not TOGGLE". After a literal group the next flag value is read explicitly. After a run that ended early (extra < max), the next segment's first flag is the opposite of this run's flag.
+
+If `extra` is larger than what was left, `left` goes negative. That is not an error: the whole run is still produced and the loop ends. Flags past F[count] are discarded, and no further bits are read.
 
 Note the asymmetry: the raw form starts at F[0], the coded form at F[1]. The intended meaning is unknown, so keep both exactly as written.
 
@@ -313,6 +315,9 @@ while pos < 64:
     if bit(): v = -v
     i = SCAN_G[pos]
     coef[i] = (v * QM[q & 3][i] * 2^(q >> 2) + 64) >> 7      // stored as int16
+```
+The reference computes the product in 32-bit signed arithmetic; it only overflows on streams with absurd levels at high q. Any wrapping behaviour there is acceptable.
+```
     pos += 1
 ```
 
@@ -364,7 +369,7 @@ The same vector values serve both:
 - **Luma:** half-pel units. Source = `(X + (vx >> 1), Y + (vy >> 1))`, fraction = `(vx & 1, vy & 1)`.
 - **Chroma:** quarter-pel units in the chroma plane. Source = `(X + (vx >> 2), Y + (vy >> 2))`, fraction = `(vx & 3, vy & 3)`.
 
-If the source top-left is outside `[0, W) × [0, H)` (W and H = picture width and height, halved with integer division for chroma), the reference **writes nothing** for that block **(unverified; the block keeps undefined content)**.
+If the source top-left is outside `[0, W) × [0, H)` (W and H = the **visible** picture width and height, not the 32-aligned size, halved with integer division for chroma), the reference **writes nothing** for that block **(unverified; the block keeps undefined content)**. Because of this, even zero-vector blocks that start in the padding right of or below the picture count as out of range.
 
 **Luma filter.** For six samples `s[-2] … s[3]` around the half-pel position between `s[0]` and `s[1]`:
 `h = clip8(( ((19·(s0 + s1)) >> 1) − 2·(s−1 + s2) + ((s−2 + s3) >> 1) + 8 ) >> 4)`
@@ -441,14 +446,14 @@ Same structure as §4 (MBs, slices, Z-order, edges, DC prediction rule, neighbou
 
 ### 5.1 State and macroblock
 
-- Block type: `bits(2)`, no LRU.
+- Block type: `bits(2)` with the numbering of §4.1, no LRU. On keyframes no type bits are read and every MB is INTRA, as in §4.2.
 - No spatial q prediction. Each (plane, intra/inter) pair has a running q, set to 8 at the start of every MB row. Each coded plane reads `dq = vlc(F_DQ)`, and if `dq != 0 and bit()`, `dq = -dq`. Then `q = running + dq`, which must be in 0 … 15 and becomes the new running value.
 - Only previous-row `mv` is reset at slice start. Per row, current `mv` and the 8 running cbps are reset to 0.
 - Neighbour refresh covers Y, C1 and C2 only (no alpha).
 - MB types:
   - **INTRA:** refresh neighbour DCs, store the four-vector prediction with zero deltas (§5.4), then intra Y, C1, C2, A.
   - **SKIP:** copy, as in §4.
-  - **MOTION:** read the vectors (§5.4), predict them, MC Y, C1, C2. The reference does **not** motion-compensate alpha here **(unverified)**.
+  - **MOTION:** read the vectors (§5.4), predict them, MC Y, C1, C2. The reference does **not** motion-compensate alpha here, leaving that alpha area undefined **(unverified)**. Copying the co-located reference alpha is a reasonable stand-in.
   - **RESIDUE:** vectors and prediction, MC Y, C1, C2 (again no alpha MC in the reference), then inter Y, C1, C2, A. There is no chroma-present bit.
 - Per coded plane, the order is: cbp, dq, DC, AC groups.
 
@@ -472,7 +477,7 @@ for i in 0..3:
     if popcount(m) == 0: h = 0
     elif popcount(m) == 1 or bit() == 0:
         h = 0
-        for each set bit j of m, lowest first: if bit(): h |= j
+        for each set bit of m, lowest first: if bit(): h |= that bit's mask (1, 2, 4 or 8)
     // else (2+ bits set and the bit read was 1): h keeps its previous value
     h &= m
     hi |= h << 4i
@@ -490,9 +495,10 @@ if popcount(lo) >= 2:
     h = (prev >> 16) & lo
     if bit(): return lo | h << 16
 h = 0
-for each set bit j of lo, lowest first: if bit(): h |= j
+for each set bit of lo, lowest first: if bit(): h |= that bit's mask (1, 2, 4 or 8)
 return lo | h << 16
 ```
+The initial `nib = (prev >> 4) & 0xF` and `h = (prev >> 20) & 0xF` really take nibble 1 of `prev`, not nibble 0. That is what the reference does; it may be a reference bug **(unverified)**.
 
 ### 5.3 DC and AC
 
