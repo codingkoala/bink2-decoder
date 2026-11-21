@@ -3,10 +3,12 @@
 #![warn(missing_docs)]
 
 pub mod bits;
+pub mod container;
 mod error;
 #[allow(missing_docs)]
 #[rustfmt::skip]
 pub mod tables;
 pub mod vlc;
 
+pub use container::{AudioTrack, Container, FrameEntry, FramePacket, Header};
 pub use error::{Error, Result};
