@@ -56,7 +56,7 @@ pub struct FrameEntry {
 /// Parsed file header.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Header {
-    /// Revision letter (`b'a'`, `b'd'`, `b'f'`, `b'g'` … `b'k'`).
+    /// Revision letter (`a`, `d`, `f`, `g` … `k`, and `l`, `m`, `n` treated like `k`).
     pub revision: u8,
     /// File size field (file size − 8).
     pub file_size_field: u32,
@@ -76,8 +76,8 @@ pub struct Header {
     pub fps_den: u32,
     /// Video flags.
     pub video_flags: u32,
-    /// Unknown extra field of revisions `i`, `j`, `k`.
-    pub extra_ijk: Option<u32>,
+    /// Unknown extra field at 0x2C of revisions `i` and later.
+    pub extra_2c: Option<u32>,
     /// Audio tracks.
     pub audio_tracks: Vec<AudioTrack>,
     /// Frame index.
@@ -102,7 +102,10 @@ pub fn is_float_revision(rev: u8) -> bool {
 
 /// True for revision letters this decoder accepts.
 pub fn is_known_revision(rev: u8) -> bool {
-    matches!(rev, b'a' | b'd' | b'f' | b'g' | b'h' | b'i' | b'j' | b'k')
+    matches!(
+        rev,
+        b'a' | b'd' | b'f' | b'g' | b'h' | b'i' | b'j' | b'k' | b'l' | b'm' | b'n'
+    )
 }
 
 /// A frame split into per-track audio payloads and the video packet (SPEC §2.2).
@@ -199,7 +202,7 @@ impl<'a> Container<'a> {
             return Err(Error::InvalidHeader("zero frame rate"));
         }
         let mut off = 0x2C;
-        let extra_ijk = if matches!(revision, b'i' | b'j' | b'k') {
+        let extra_2c = if revision >= b'i' {
             let v = le32(d, off)?;
             off += 4;
             Some(v)
@@ -271,7 +274,7 @@ impl<'a> Container<'a> {
                 fps_num,
                 fps_den,
                 video_flags,
-                extra_ijk,
+                extra_2c,
                 audio_tracks,
                 frames,
             },
@@ -335,7 +338,7 @@ pub(crate) mod tests {
         let mut h = Vec::new();
         let n = tracks.len();
         let mut header_len = 0x2C + 12 * n + 4 * frames.len();
-        if matches!(rev, b'i' | b'j' | b'k') {
+        if rev >= b'i' {
             header_len += 4;
         }
         let total: usize = header_len + frames.iter().map(|f| f.1.len()).sum::<usize>();
@@ -356,7 +359,7 @@ pub(crate) mod tests {
         ] {
             h.extend_from_slice(&v.to_le_bytes());
         }
-        if matches!(rev, b'i' | b'j' | b'k') {
+        if rev >= b'i' {
             h.extend_from_slice(&0xDEADu32.to_le_bytes());
         }
         for _ in tracks {
@@ -403,7 +406,7 @@ pub(crate) mod tests {
         assert_eq!((h.width, h.height, h.fps_num, h.fps_den), (100, 50, 30, 1));
         assert!(h.has_alpha());
         assert!(!h.is_float_variant());
-        assert_eq!(h.extra_ijk, Some(0xDEAD));
+        assert_eq!(h.extra_2c, Some(0xDEAD));
         assert_eq!(h.audio_tracks.len(), 2);
         assert_eq!(h.audio_tracks[0].sample_rate, 44100);
         assert!(h.audio_tracks[0].is_stereo() && !h.audio_tracks[0].is_dct());
@@ -419,6 +422,18 @@ pub(crate) mod tests {
         assert!(!p1.keyframe);
         assert_eq!(p1.video, &[0xCC]);
         assert_eq!(c.frame(2), Err(Error::FrameOutOfRange));
+    }
+
+    #[test]
+    fn revisions_l_m_n_are_like_k() {
+        for rev in *b"lmn" {
+            let file = build_file(rev, 64, 32, 3, &[], &[(true, vec![7, 8]), (false, vec![9])]);
+            let c = Container::parse(&file).unwrap();
+            assert_eq!(c.header.extra_2c, Some(0xDEAD));
+            assert!(!c.header.is_float_variant());
+            assert_eq!(c.frame(1).unwrap().video, &[9]);
+            assert_eq!(crate::slice_boundaries(rev, 1440, 3).len(), 8);
+        }
     }
 
     #[test]
@@ -440,7 +455,7 @@ pub(crate) mod tests {
         bik.resize(1024, 0);
         bik.extend_from_slice(&file);
         assert_eq!(Container::parse(&bik).unwrap_err(), Error::BadSignature);
-        assert_eq!(c.header.extra_ijk, None);
+        assert_eq!(c.header.extra_2c, None);
         assert_eq!(c.frame(0).unwrap().video, &[1, 2, 3]);
     }
 
