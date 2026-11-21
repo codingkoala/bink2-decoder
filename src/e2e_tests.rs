@@ -230,6 +230,62 @@ fn g_bad_data_errors_do_not_panic() {
     }
 }
 
+/// One float-variant INTRA MB with no residuals. `corner` = MB is at both edges.
+fn f_flat_intra_mb(w: &mut BitWriter, corner: bool, alpha: bool, luma_extra: u32) {
+    let planes = if alpha { 4 } else { 3 };
+    for p in 0..planes {
+        w.put("10"); // cbp: lo = prev & 0xFFFF = 0, no further bits
+        w.put("1"); // dq = 0 -> q = 8
+        w.put("000"); // DC width 0
+        if corner {
+            // e = F_DC_BITS[8] - 1 + 0 = 2 -> bits(8)
+            let v = if p == 0 { luma_extra } else { 0 };
+            let s: String = (0..8).map(|i| if v >> i & 1 != 0 { '1' } else { '0' }).collect();
+            w.put(&s);
+            if v != 0 {
+                w.put("0");
+            }
+        }
+    }
+}
+
+#[test]
+fn f_keyframe_flat_grey() {
+    // revision f, 64x32: boundaries [32, 32] -> slice 1 is empty.
+    let mut w = BitWriter::default();
+    f_flat_intra_mb(&mut w, true, true, 0);
+    f_flat_intra_mb(&mut w, false, true, 0);
+    let pkt = packet(0, &[w.finish(), vec![]]);
+    let mut dec = Decoder::with_params(b'f', 64, 32, 0x0010_0000).unwrap();
+    let f = dec.decode(&pkt, true).unwrap();
+    assert_flat(&f.y, 128, "Y");
+    assert_flat(&f.u, 128, "U");
+    assert_flat(&f.v, 128, "V");
+    assert_flat(f.alpha.as_ref().unwrap(), 128, "A");
+}
+
+#[test]
+fn f_keyframe_corner_dc_and_skip() {
+    // Corner DC: v = 16 -> r[0] = 16 * F_DC_Q[8] = 160 -> dc 1184 everywhere in luma -> 148.
+    let mut w = BitWriter::default();
+    f_flat_intra_mb(&mut w, true, false, 16);
+    let pkt = packet(0, &[w.finish(), vec![]]);
+    let mut dec = Decoder::with_params(b'd', 32, 32, 0).unwrap();
+    let f = dec.decode(&pkt, true).unwrap();
+    assert_flat(&f.y, 148, "Y");
+    assert_flat(&f.u, 128, "U");
+    // P frame: SKIP = bits(2) = 1
+    let mut w = BitWriter::default();
+    w.put("10");
+    let f = dec.decode(&packet(0, &[w.finish(), vec![]]), false).unwrap();
+    assert_flat(&f.y, 148, "Y after SKIP");
+    // MOTION = 2: x and y widths 0, corner offsets 0
+    let mut w = BitWriter::default();
+    w.put("01").put("000").put("00000").put("000").put("00000");
+    let f = dec.decode(&packet(0, &[w.finish(), vec![]]), false).unwrap();
+    assert_flat(&f.y, 148, "Y after MOTION");
+}
+
 #[test]
 fn g_lru_across_macroblocks() {
     // 64x32, two MBs. P frame: SKIP ("000", LRU becomes [MOTION, SKIP, RESIDUE, INTRA]), then
@@ -259,7 +315,12 @@ fn fuzz_all_variants_never_panic() {
         seed ^= seed << 5;
         seed
     };
-    for (rev, w, h, flags) in [(b'g', 96u32, 160u32, 0x0010_0000u32), (b'k', 70, 70, 0x0010_0003)] {
+    for (rev, w, h, flags) in [
+        (b'f', 64u32, 64u32, 0x0010_0000u32),
+        (b'a', 40, 72, 0),
+        (b'g', 96, 160, 0x0010_0000),
+        (b'k', 70, 70, 0x0010_0003),
+    ] {
         let mut dec = Decoder::with_params(rev, w, h, flags).unwrap();
         let s = crate::slice_boundaries(rev, h, flags).len();
         for it in 0..1500 {

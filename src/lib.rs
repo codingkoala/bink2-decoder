@@ -7,6 +7,7 @@ pub mod container;
 mod dsp;
 pub mod edge_flags;
 mod error;
+mod f;
 mod frame;
 mod g;
 #[allow(missing_docs)]

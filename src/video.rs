@@ -532,14 +532,17 @@ impl Decoder {
                 mb_w: self.aligned_w / 32,
                 opts: self.opts,
             };
-            if is_float_revision(self.revision) {
-                return Err(Error::UnsupportedRevision(self.revision));
-            }
+            let float = is_float_revision(self.revision);
             let mut gstate = crate::g::SliceRows::new(ctx.mb_w);
+            let mut fstate = crate::f::SliceRows::new(ctx.mb_w);
             for (i, &(r0, r1)) in hdr.slice_rows.iter().enumerate() {
                 // SPEC-QUESTION: the reference only warns when a slice over- or under-reads; we
                 // allow reading into the next slice but fail on reading past the packet end.
-                crate::g::decode_slice(&mut ctx, &mut br, &mut gstate, r0, r1)?;
+                if float {
+                    crate::f::decode_slice(&mut ctx, &mut br, &mut fstate, r0, r1)?;
+                } else {
+                    crate::g::decode_slice(&mut ctx, &mut br, &mut gstate, r0, r1)?;
+                }
                 br.align();
                 br.seek_byte(hdr.slice_end[i])?;
             }
