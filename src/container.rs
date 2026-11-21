@@ -6,10 +6,10 @@ use crate::error::{Error, Result};
 pub const MAX_FRAMES: u32 = 1_000_000;
 /// Largest accepted number of audio tracks (SPEC §2.1).
 pub const MAX_AUDIO_TRACKS: u32 = 256;
-/// Largest accepted width or height.
-// SPEC-QUESTION: the spec gives no limit for width/height; 16384 is our own bound so that
-// header values cannot request unbounded frame buffers.
-pub const MAX_DIMENSION: u32 = 16384;
+/// Largest accepted width (SPEC §2.1).
+pub const MAX_WIDTH: u32 = 7680;
+/// Largest accepted height (SPEC §2.1).
+pub const MAX_HEIGHT: u32 = 4800;
 
 /// Video flag: the video has an alpha plane.
 pub const VIDEO_FLAG_ALPHA: u32 = 0x0010_0000;
@@ -132,19 +132,20 @@ fn le32(d: &[u8], off: usize) -> Result<u32> {
     Ok(u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
 }
 
-fn has_signature(d: &[u8]) -> bool {
-    d.len() >= 4 && &d[0..3] == b"KB2" && is_known_revision(d[3])
-}
-
-/// Finds the start of the Bink data: offset 0, or the first 512-byte boundary holding the
-/// signature for SMUS-wrapped files.
-// SPEC-QUESTION: SPEC §2.1 does not say how a SMUS wrapper is recognised or whether the data
-// after the signature is contiguous; we scan 512-byte boundaries for `KB2` + a known revision
-// and treat everything from there as one contiguous Bink file.
+/// Finds the start of the Bink data (SPEC §2.1): offset 0 for a plain file, or, for a file
+/// starting with `SMUS`, the first 512-byte step holding a Bink signature (`KB2`, or Bink 1's
+/// `BIK`). Returns `None` if there is no signature.
 pub fn find_signature(data: &[u8]) -> Option<usize> {
-    let mut off = 0;
-    while off < data.len() {
-        if has_signature(&data[off..]) {
+    if data.starts_with(b"KB2") {
+        return Some(0);
+    }
+    if !data.starts_with(b"SMUS") {
+        return None;
+    }
+    let mut off = 512;
+    while off + 3 <= data.len() {
+        let sig = &data[off..off + 3];
+        if sig == b"KB2" || sig == b"BIK" {
             return Some(off);
         }
         off += 512;
@@ -166,15 +167,15 @@ pub struct Container<'a> {
 impl<'a> Container<'a> {
     /// Parses the header and frame index of a whole file held in memory.
     pub fn parse(file: &'a [u8]) -> Result<Container<'a>> {
-        let base = find_signature(file).ok_or_else(|| {
-            if file.len() >= 4 && &file[0..3] == b"KB2" {
-                Error::UnsupportedRevision(file[3])
-            } else {
-                Error::BadSignature
-            }
-        })?;
+        let base = find_signature(file).ok_or(Error::BadSignature)?;
         let d = &file[base..];
-        let revision = d[3];
+        if !d.starts_with(b"KB2") {
+            return Err(Error::BadSignature); // Bink 1 inside SMUS
+        }
+        let revision = *d.get(3).ok_or(Error::Truncated)?;
+        if !is_known_revision(revision) {
+            return Err(Error::UnsupportedRevision(revision));
+        }
         let file_size_field = le32(d, 0x04)?;
         let num_frames = le32(d, 0x08)?;
         let largest_frame = le32(d, 0x0C)?;
@@ -191,7 +192,7 @@ impl<'a> Container<'a> {
         if n_audio > MAX_AUDIO_TRACKS {
             return Err(Error::InvalidHeader("too many audio tracks"));
         }
-        if width == 0 || height == 0 || width > MAX_DIMENSION || height > MAX_DIMENSION {
+        if !(1..=MAX_WIDTH).contains(&width) || !(1..=MAX_HEIGHT).contains(&height) {
             return Err(Error::InvalidHeader("bad picture size"));
         }
         if fps_num == 0 || fps_den == 0 {
@@ -428,6 +429,17 @@ pub(crate) mod tests {
         wrapped.extend_from_slice(&file);
         let c = Container::parse(&wrapped).unwrap();
         assert_eq!(c.base_offset, 1024);
+        // without the SMUS tag the signature is only looked for at offset 0
+        let mut unwrapped = vec![0u8; 512];
+        unwrapped.extend_from_slice(&file);
+        assert_eq!(Container::parse(&unwrapped).unwrap_err(), Error::BadSignature);
+        // the first Bink signature wins, and a Bink 1 one is not accepted
+        let mut bik = b"SMUS".to_vec();
+        bik.resize(512, 0);
+        bik.extend_from_slice(b"BIKi");
+        bik.resize(1024, 0);
+        bik.extend_from_slice(&file);
+        assert_eq!(Container::parse(&bik).unwrap_err(), Error::BadSignature);
         assert_eq!(c.header.extra_ijk, None);
         assert_eq!(c.frame(0).unwrap().video, &[1, 2, 3]);
     }
@@ -447,6 +459,17 @@ pub(crate) mod tests {
         let mut f = build_file(b'g', 32, 32, 0, &[], &[(true, vec![1])]);
         f[0x20..0x24].copy_from_slice(&0u32.to_le_bytes());
         assert!(matches!(Container::parse(&f), Err(Error::InvalidHeader(_))));
+        // size limits: width 1..=7680, height 1..=4800
+        for (w, h, ok) in [
+            (7680, 4800, true),
+            (7681, 32, false),
+            (32, 4801, false),
+            (0, 32, false),
+            (32, 0, false),
+        ] {
+            let f = build_file(b'g', w, h, 0, &[], &[(true, vec![1])]);
+            assert_eq!(Container::parse(&f).is_ok(), ok, "{w}x{h}");
+        }
         // non-increasing offsets
         let mut f = build_file(b'g', 32, 32, 0, &[], &[(true, vec![1]), (false, vec![2])]);
         let o0 = u32::from_le_bytes(f[0x2C..0x30].try_into().unwrap());

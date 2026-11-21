@@ -1,7 +1,7 @@
 //! Video packet decoding shared by both variants (SPEC §3, §4.6–§4.8).
 
 use crate::bits::BitReader;
-use crate::container::{is_float_revision, is_known_revision, Header, MAX_DIMENSION};
+use crate::container::{is_float_revision, is_known_revision, Header, MAX_HEIGHT, MAX_WIDTH};
 use crate::dsp::{block_dc_from_pixels, ceil_to, clamp, copy_block, mc_chroma, mc_luma};
 use crate::edge_flags::read_edge_flags;
 use crate::error::{Error, Result};
@@ -428,7 +428,7 @@ impl Decoder {
         if !is_known_revision(revision) {
             return Err(Error::UnsupportedRevision(revision));
         }
-        if width == 0 || height == 0 || width > MAX_DIMENSION || height > MAX_DIMENSION {
+        if !(1..=MAX_WIDTH).contains(&width) || !(1..=MAX_HEIGHT).contains(&height) {
             return Err(Error::InvalidHeader("bad picture size"));
         }
         Ok(Decoder {
