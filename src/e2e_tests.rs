@@ -378,7 +378,10 @@ fn slice_reports_and_concealment() {
     assert!(r[0].in_sync());
     assert_eq!(r[1].failure.as_ref().unwrap().mb, (0, 1));
 
-    dec.set_options(crate::DecoderOptions { conceal_slice_errors: true, ..Default::default() });
+    dec.set_options(crate::DecoderOptions {
+        conceal_slice_errors: true,
+        ..Default::default()
+    });
     let f = dec.decode(&pkt, true).unwrap();
     assert!(dec.slice_reports()[0].in_sync());
     assert!(!dec.slice_reports()[1].in_sync());

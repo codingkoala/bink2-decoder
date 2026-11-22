@@ -391,6 +391,13 @@ fn decode_mb(
             }
         }
     }
+    if let Some(info) = ctx.mb_info.get_mut(mby * ctx.mb_w + mbx) {
+        *info = crate::video::MbInfo {
+            mb_type: ty,
+            intra_q: 0,
+            inter_q: 0,
+        };
+    }
     rows.cur[mbx] = me;
     Ok(())
 }

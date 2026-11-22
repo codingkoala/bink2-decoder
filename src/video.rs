@@ -29,6 +29,52 @@ pub enum OutOfRangeMv {
     ClampToPicture,
 }
 
+/// Where the inferred deblocking filter (docs/INFERRED.md) is applied.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DeblockMode {
+    /// No filter (the behaviour described by SPEC.md).
+    #[default]
+    Off,
+    /// Filter the output only; references stay unfiltered.
+    Post,
+    /// Filter the frame before it is output and used as the next reference.
+    InLoop,
+}
+
+/// Parameters of the inferred deblocking filter. Not part of SPEC.md: a black-box model fitted
+/// to RAD's own output, see docs/INFERRED.md. The defaults (other than `mode`) are the best fit
+/// found: INTRA MBs only, luma and chroma, edge flags respected, no step threshold.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Deblock {
+    /// Where the filter runs.
+    pub mode: DeblockMode,
+    /// Also filter the chroma planes (edges every 8 chroma pixels, using the luma flags of
+    /// the co-located 16-pixel luma edge).
+    pub chroma: bool,
+    /// Filter every edge when the packet carries no edge flags.
+    pub without_flags: bool,
+    /// Leave edges whose step |q0 - p0| is at least this large.
+    pub max_step: i32,
+    /// Filter horizontal edges before vertical ones.
+    pub horizontal_first: bool,
+    /// Bit t set: edges are filtered in MBs of type t (bit 0 INTRA … bit 3 RESIDUE). The MB is
+    /// the one holding the pixel right of / below the edge.
+    pub types: u8,
+}
+
+impl Default for Deblock {
+    fn default() -> Self {
+        Deblock {
+            mode: DeblockMode::Off,
+            chroma: true,
+            without_flags: false,
+            max_step: 256,
+            horizontal_first: false,
+            types: 1,
+        }
+    }
+}
+
 /// Decoder options for the unverified behaviours.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct DecoderOptions {
@@ -38,6 +84,19 @@ pub struct DecoderOptions {
     /// mid-grey without one) and carry on with the next slice instead of failing the frame.
     /// The failure is still recorded in [`Decoder::slice_reports`].
     pub conceal_slice_errors: bool,
+    /// Inferred deblocking filter (off by default).
+    pub deblock: Deblock,
+}
+
+/// Side information about one decoded macroblock.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct MbInfo {
+    /// Block type: 0 INTRA, 1 SKIP, 2 MOTION, 3 RESIDUE.
+    pub mb_type: u8,
+    /// Intra q (integer variant; 0 in the float variant).
+    pub intra_q: i32,
+    /// Inter q (integer variant; 0 in the float variant).
+    pub inter_q: i32,
 }
 
 /// Where and why a slice failed.
@@ -111,6 +170,9 @@ pub(crate) struct PacketHeader {
     pub slice_rows: Vec<(usize, usize)>,
     /// Byte offset where each slice ends.
     pub slice_end: Vec<usize>,
+    /// Row and column edge flag lists, when present.
+    pub row_flags: Option<Vec<bool>>,
+    pub col_flags: Option<Vec<bool>>,
 }
 
 fn le32(d: &[u8], off: usize) -> Result<u32> {
@@ -345,6 +407,8 @@ pub(crate) struct FrameCtx<'a> {
     pub opts: DecoderOptions,
     /// Set by the slice decoders to the MB that failed.
     pub fail_mb: Option<(usize, usize)>,
+    /// Per-MB side information, raster order.
+    pub mb_info: &'a mut [MbInfo],
 }
 
 impl FrameCtx<'_> {
@@ -487,6 +551,8 @@ pub struct Decoder {
     spare: Option<FrameBuf>,
     reports: Vec<SliceReport>,
     last_frame_flags: u32,
+    last_edge_flags: (Option<Vec<bool>>, Option<Vec<bool>>),
+    mb_info: Vec<MbInfo>,
 }
 
 impl Decoder {
@@ -516,6 +582,8 @@ impl Decoder {
             spare: None,
             reports: Vec::new(),
             last_frame_flags: 0,
+            last_edge_flags: (None, None),
+            mb_info: Vec::new(),
         })
     }
 
@@ -534,9 +602,44 @@ impl Decoder {
         self.last_frame_flags
     }
 
+    /// Row and column edge flag lists (SPEC §3.3) of the last packet, when present.
+    pub fn last_edge_flags(&self) -> (Option<&[bool]>, Option<&[bool]>) {
+        (self.last_edge_flags.0.as_deref(), self.last_edge_flags.1.as_deref())
+    }
+
+    /// Per-MB side information of the last decoded frame, raster order (`ceil(w/32)` per row).
+    pub fn last_mb_info(&self) -> &[MbInfo] {
+        &self.mb_info
+    }
+
     /// Per-slice bit accounting of the last [`Decoder::decode`] call.
     pub fn slice_reports(&self) -> &[SliceReport] {
         &self.reports
+    }
+
+    /// Replaces the reference frame with the given planar 4:2:0 picture (`width × height` luma,
+    /// `ceil(w/2) × ceil(h/2)` chroma, Cb then Cr). Analysis hook: lets a P frame be decoded
+    /// against an externally supplied reference, e.g. to measure one-step errors.
+    #[doc(hidden)]
+    pub fn debug_set_reference_yuv(&mut self, y: &[u8], u: &[u8], v: &[u8]) {
+        let mut f = FrameBuf::new(self.aligned_w, self.aligned_h, self.has_alpha);
+        let (w, h) = (self.width, self.height);
+        let (cw, ch) = (w.div_ceil(2), h.div_ceil(2));
+        let put = |p: &mut Plane, src: &[u8], sw: usize, sh: usize| {
+            for yy in 0..p.h {
+                for xx in 0..p.w {
+                    let sx = xx.min(sw - 1);
+                    let sy = yy.min(sh - 1);
+                    let i = p.idx(xx as i64, yy as i64);
+                    p.data[i] = src.get(sy * sw + sx).copied().unwrap_or(128);
+                }
+            }
+        };
+        put(&mut f.planes[0], y, w, h);
+        put(&mut f.planes[1], v, cw, ch);
+        put(&mut f.planes[2], u, cw, ch);
+        f.extend_edges();
+        self.reference = Some(f);
     }
 
     /// Drops the reference frame (e.g. before seeking to a keyframe).
@@ -575,19 +678,22 @@ impl Decoder {
             start = b;
         }
         br.seek_byte(4 * s)?;
+        let (mut row_flags, mut col_flags) = (None, None);
         if frame_flags & 0x10000 != 0 {
-            // Edge flags: parsed and discarded (SPEC §3.2 step 5, open question 1).
+            // Edge flags (SPEC §3.2 step 5, open question 1).
             if frame_flags & 0x8000 == 0 {
-                read_edge_flags(br, ceil_to(self.height as u32, 16) as usize / 8 - 1)?;
+                row_flags = Some(read_edge_flags(br, ceil_to(self.height as u32, 16) as usize / 8 - 1)?);
             }
             if frame_flags & 0x4000 == 0 {
-                read_edge_flags(br, ceil_to(self.width as u32, 16) as usize / 8 - 1)?;
+                col_flags = Some(read_edge_flags(br, ceil_to(self.width as u32, 16) as usize / 8 - 1)?);
             }
         }
         Ok(PacketHeader {
             frame_flags,
             slice_rows,
             slice_end,
+            row_flags,
+            col_flags,
         })
     }
 
@@ -602,6 +708,10 @@ impl Decoder {
         self.reports.clear();
         let hdr = self.parse_packet_header(packet, &mut br)?;
         self.last_frame_flags = hdr.frame_flags;
+        self.last_edge_flags = (hdr.row_flags.clone(), hdr.col_flags.clone());
+        self.mb_info.clear();
+        self.mb_info
+            .resize((self.aligned_w / 32) * (self.aligned_h / 32), MbInfo::default());
         let mut cur = self
             .spare
             .take()
@@ -618,6 +728,7 @@ impl Decoder {
                 mb_w: self.aligned_w / 32,
                 opts: self.opts,
                 fail_mb: None,
+                mb_info: &mut self.mb_info,
             };
             let float = is_float_revision(self.revision);
             let mut gstate = crate::g::SliceRows::new(ctx.mb_w);
@@ -655,10 +766,59 @@ impl Decoder {
                 br.seek_byte(hdr.slice_end[i])?;
             }
         }
-        cur.extend_edges();
-        let out = self.output(&cur, keyframe);
+        let out = match self.opts.deblock.mode {
+            DeblockMode::Off => {
+                cur.extend_edges();
+                self.output(&cur, keyframe)
+            }
+            DeblockMode::InLoop => {
+                self.apply_deblock(&mut cur);
+                cur.extend_edges();
+                self.output(&cur, keyframe)
+            }
+            DeblockMode::Post => {
+                cur.extend_edges();
+                let mut f = cur.clone();
+                self.apply_deblock(&mut f);
+                self.output(&f, keyframe)
+            }
+        };
         self.spare = self.reference.replace(cur);
         Ok(out)
+    }
+
+    fn apply_deblock(&self, f: &mut FrameBuf) {
+        let d = self.opts.deblock;
+        let (rows, cols) = (self.last_edge_flags.0.as_deref(), self.last_edge_flags.1.as_deref());
+        // Vertical edge at x = 8k uses column flag F[k]; horizontal edge at y = 8k uses row
+        // flag F[k-1] (measured, docs/INFERRED.md). A set flag switches the edge off.
+        let off = |flags: Option<&[bool]>, i: Option<usize>| match (flags, i) {
+            (Some(fl), Some(i)) => fl.get(i).copied().unwrap_or(false),
+            (Some(_), None) => false,
+            (None, _) => !d.without_flags,
+        };
+        let mb_w = self.aligned_w / 32;
+        let info = &self.mb_info;
+        for (p, plane) in f.planes.iter_mut().enumerate() {
+            let chroma = is_chroma(p);
+            let mbs = if chroma { 16 } else { 32 };
+            let pix_on = |x: usize, y: usize| {
+                let t = info.get((y / mbs) * mb_w + x / mbs).map(|m| m.mb_type).unwrap_or(0);
+                d.types & (1 << t) != 0
+            };
+            if chroma && !d.chroma {
+                continue;
+            }
+            let s = if chroma { 2 } else { 1 };
+            let col_off = |k: usize| off(cols, Some(s * k));
+            let row_off = |k: usize| off(rows, (s * k).checked_sub(1));
+            if d.horizontal_first {
+                crate::deblock::filter_plane(plane, false, true, &col_off, &row_off, d.max_step, &pix_on);
+                crate::deblock::filter_plane(plane, true, false, &col_off, &row_off, d.max_step, &pix_on);
+            } else {
+                crate::deblock::filter_plane(plane, true, true, &col_off, &row_off, d.max_step, &pix_on);
+            }
+        }
     }
 
     fn output(&self, f: &FrameBuf, keyframe: bool) -> VideoFrame {

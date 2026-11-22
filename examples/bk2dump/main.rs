@@ -6,8 +6,9 @@
 //! range (SPEC open question 8), so the tag is a convention, not a statement about the source.
 //!
 //! Options:
-//! - `--png DIR`: write frames as PNG into DIR (`frame_NNNN.png`), converted with BT.601
-//!   limited range.
+//! - `--png DIR`: write frames as PNG into DIR (`frame_NNNN.png`), converted with BT.601 full
+//!   range, centred bilinear chroma (the fit to RAD's own converter, docs/INFERRED.md).
+//! - `--limited`: convert with BT.601 limited range and nearest chroma instead.
 //! - `--png-frames LIST`: comma-separated frame numbers to export (default: all decoded).
 //! - `--crop X,Y,W,H`: export only this rectangle (full resolution).
 //! - `--half`: export at half size (2x2 average) after cropping.
@@ -16,6 +17,10 @@
 //! - `--conceal`: conceal failed slices (copy from the previous frame) instead of failing the
 //!   frame; the failures are still printed.
 //! - `--report`: print per-slice bit accounting (where each slice ended vs. the slice table).
+//! - `--deblock MODE[,nochroma][,all][,max=N][,hfirst][,types=MASK]`: enable the inferred
+//!   deblocking filter (docs/INFERRED.md); MODE is `post` or `inloop` (best fit: `inloop`).
+//! - `--side FILE`: write per-frame side information (frame flags, edge flags, MB types and q)
+//!   as text, one block per frame, for analysis scripts.
 
 mod png;
 
@@ -34,12 +39,15 @@ struct Opts {
     half: bool,
     swap_uv: bool,
     keep_going: bool,
+    limited: bool,
     conceal: bool,
     report: bool,
+    side: Option<String>,
+    deblock: bink2::Deblock,
 }
 
 const USAGE: &str = "usage: bk2dump <in.bk2> <out.y4m | -> [max_frames] [--png DIR] [--png-frames N,N,..] \
-                     [--crop X,Y,W,H] [--half] [--swap-uv] [--keep-going] [--conceal] [--report]";
+                     [--crop X,Y,W,H] [--half] [--swap-uv] [--limited] [--keep-going] [--conceal] [--report] [--side FILE] [--deblock MODE,...]";
 
 fn parse_args() -> Result<Opts, String> {
     let mut o = Opts::default();
@@ -68,8 +76,33 @@ fn parse_args() -> Result<Opts, String> {
             "--half" => o.half = true,
             "--swap-uv" => o.swap_uv = true,
             "--keep-going" => o.keep_going = true,
+            "--limited" => o.limited = true,
             "--conceal" => o.conceal = true,
             "--report" => o.report = true,
+            "--side" => o.side = Some(val()?),
+            "--deblock" => {
+                let v = val()?;
+                let mut d = bink2::Deblock::default();
+                for part in v.split(',') {
+                    match part {
+                        "post" => d.mode = bink2::DeblockMode::Post,
+                        "inloop" => d.mode = bink2::DeblockMode::InLoop,
+                        "off" => d.mode = bink2::DeblockMode::Off,
+                        "chroma" => d.chroma = true,
+                        "nochroma" => d.chroma = false,
+                        "all" => d.without_flags = true,
+                        "hfirst" => d.horizontal_first = true,
+                        _ if part.starts_with("types=") => {
+                            d.types = part[6..].parse().map_err(|_| "bad types=".to_string())?
+                        }
+                        _ if part.starts_with("max=") => {
+                            d.max_step = part[4..].parse().map_err(|_| "bad max=".to_string())?
+                        }
+                        _ => return Err(format!("unknown --deblock part {part}")),
+                    }
+                }
+                o.deblock = d;
+            }
             _ if a.starts_with("--") => return Err(format!("unknown option {a}")),
             _ => pos.push(a),
         }
@@ -110,16 +143,40 @@ fn to_rgb(f: &bink2::VideoFrame, o: &Opts) -> (usize, usize, Vec<u8>) {
     let cw = cw.min(f.width - cx);
     let ch = ch.min(f.height - cy);
     let (u, v) = if o.swap_uv { (&f.v, &f.u) } else { (&f.u, &f.v) };
-    let cwid = f.chroma_width();
+    let (cwid, chei) = (f.chroma_width(), f.chroma_height());
+    // Centred bilinear chroma upsampling (weights 3/4, 1/4 in each direction).
+    let chroma = |c: &[u8], x: usize, y: usize| -> f32 {
+        let (cx0, cy0) = (x / 2, y / 2);
+        let cx1 = if x % 2 == 1 {
+            (cx0 + 1).min(cwid - 1)
+        } else {
+            cx0.saturating_sub(1)
+        };
+        let cy1 = if y % 2 == 1 {
+            (cy0 + 1).min(chei - 1)
+        } else {
+            cy0.saturating_sub(1)
+        };
+        let g = |xx: usize, yy: usize| c[yy * cwid + xx] as f32;
+        (9.0 * g(cx0, cy0) + 3.0 * g(cx1, cy0) + 3.0 * g(cx0, cy1) + g(cx1, cy1)) / 16.0
+    };
     let px = |x: usize, y: usize| -> [f32; 3] {
-        let yy = f.y[y * f.width + x] as f32 - 16.0;
-        let cb = u[(y / 2) * cwid + x / 2] as f32 - 128.0;
-        let cr = v[(y / 2) * cwid + x / 2] as f32 - 128.0;
-        [
-            1.164 * yy + 1.596 * cr,
-            1.164 * yy - 0.392 * cb - 0.813 * cr,
-            1.164 * yy + 2.017 * cb,
-        ]
+        if o.limited {
+            let yy = f.y[y * f.width + x] as f32 - 16.0;
+            let cb = u[(y / 2) * cwid + x / 2] as f32 - 128.0;
+            let cr = v[(y / 2) * cwid + x / 2] as f32 - 128.0;
+            return [
+                1.164 * yy + 1.596 * cr,
+                1.164 * yy - 0.392 * cb - 0.813 * cr,
+                1.164 * yy + 2.017 * cb,
+            ];
+        }
+        // BT.601 full range with chroma centred on 128.5: the best fit to RAD's converter
+        // (docs/INFERRED.md).
+        let yy = f.y[y * f.width + x] as f32;
+        let cb = chroma(u, x, y) - 128.5;
+        let cr = chroma(v, x, y) - 128.5;
+        [yy + 1.402 * cr, yy - 0.344136 * cb - 0.714136 * cr, yy + 1.772 * cb]
     };
     let s = if o.half { 2 } else { 1 };
     let (ow, oh) = (cw / s, ch / s);
@@ -194,13 +251,49 @@ fn run(o: &Opts) -> Result<(), Box<dyn std::error::Error>> {
     let mut dec = bink2::Decoder::new(h)?;
     dec.set_options(bink2::DecoderOptions {
         conceal_slice_errors: o.conceal,
+        deblock: o.deblock,
         ..Default::default()
     });
     let (mut slices_total, mut slices_sync) = (0usize, 0usize);
+    let mut side = match &o.side {
+        Some(p) => Some(BufWriter::new(File::create(p)?)),
+        None => None,
+    };
     let n = file.num_frames().min(o.max_frames.unwrap_or(usize::MAX));
     let (mut ok, mut failed) = (0usize, 0usize);
     for i in 0..n {
         let res = file.frame(i).and_then(|pkt| dec.decode(pkt.video, pkt.keyframe));
+        if let Some(sf) = side.as_mut() {
+            let bits = |f: Option<&[bool]>| match f {
+                Some(f) => f.iter().map(|&b| if b { '1' } else { '0' }).collect::<String>(),
+                None => "-".to_string(),
+            };
+            let (rf, cf) = dec.last_edge_flags();
+            writeln!(
+                sf,
+                "frame {i} key {} flags {:08x}",
+                res.as_ref().map(|f| f.keyframe).unwrap_or(false) as u8,
+                dec.last_frame_flags()
+            )?;
+            writeln!(sf, "rowflags {}", bits(rf))?;
+            writeln!(sf, "colflags {}", bits(cf))?;
+            let info = dec.last_mb_info();
+            writeln!(
+                sf,
+                "types {}",
+                info.iter().map(|m| (b'0' + m.mb_type) as char).collect::<String>()
+            )?;
+            writeln!(
+                sf,
+                "intraq {}",
+                info.iter().map(|m| m.intra_q.to_string()).collect::<Vec<_>>().join(",")
+            )?;
+            writeln!(
+                sf,
+                "interq {}",
+                info.iter().map(|m| m.inter_q.to_string()).collect::<Vec<_>>().join(",")
+            )?;
+        }
         let reps = dec.slice_reports();
         slices_total += reps.len();
         slices_sync += reps.iter().filter(|r| r.in_sync()).count();
@@ -253,6 +346,9 @@ fn run(o: &Opts) -> Result<(), Box<dyn std::error::Error>> {
     }
     if let Some(mut out) = y4m {
         out.flush()?;
+    }
+    if let Some(mut sf) = side {
+        sf.flush()?;
     }
     println!("decoded {ok} of {n} frames, {failed} failed; {slices_sync} of {slices_total} slices in sync");
     Ok(())
