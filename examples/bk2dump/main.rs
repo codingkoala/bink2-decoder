@@ -17,8 +17,7 @@
 //! - `--conceal`: conceal failed slices (copy from the previous frame) instead of failing the
 //!   frame; the failures are still printed.
 //! - `--report`: print per-slice bit accounting (where each slice ended vs. the slice table).
-//! - `--deblock MODE[,nochroma][,all][,max=N][,hfirst][,types=MASK]`: enable the inferred
-//!   deblocking filter (docs/INFERRED.md); MODE is `post` or `inloop` (best fit: `inloop`).
+//! - `--no-loop-filter`: switch the in-loop filter (SPEC §4.10) off, for debugging.
 //! - `--side FILE`: write per-frame side information (frame flags, edge flags, MB types and q)
 //!   as text, one block per frame, for analysis scripts.
 
@@ -43,11 +42,11 @@ struct Opts {
     conceal: bool,
     report: bool,
     side: Option<String>,
-    deblock: bink2::Deblock,
+    no_loop_filter: bool,
 }
 
 const USAGE: &str = "usage: bk2dump <in.bk2> <out.y4m | -> [max_frames] [--png DIR] [--png-frames N,N,..] \
-                     [--crop X,Y,W,H] [--half] [--swap-uv] [--limited] [--keep-going] [--conceal] [--report] [--side FILE] [--deblock MODE,...]";
+                     [--crop X,Y,W,H] [--half] [--swap-uv] [--limited] [--keep-going] [--conceal] [--report] [--side FILE] [--no-loop-filter]";
 
 fn parse_args() -> Result<Opts, String> {
     let mut o = Opts::default();
@@ -80,29 +79,7 @@ fn parse_args() -> Result<Opts, String> {
             "--conceal" => o.conceal = true,
             "--report" => o.report = true,
             "--side" => o.side = Some(val()?),
-            "--deblock" => {
-                let v = val()?;
-                let mut d = bink2::Deblock::default();
-                for part in v.split(',') {
-                    match part {
-                        "post" => d.mode = bink2::DeblockMode::Post,
-                        "inloop" => d.mode = bink2::DeblockMode::InLoop,
-                        "off" => d.mode = bink2::DeblockMode::Off,
-                        "chroma" => d.chroma = true,
-                        "nochroma" => d.chroma = false,
-                        "all" => d.without_flags = true,
-                        "hfirst" => d.horizontal_first = true,
-                        _ if part.starts_with("types=") => {
-                            d.types = part[6..].parse().map_err(|_| "bad types=".to_string())?
-                        }
-                        _ if part.starts_with("max=") => {
-                            d.max_step = part[4..].parse().map_err(|_| "bad max=".to_string())?
-                        }
-                        _ => return Err(format!("unknown --deblock part {part}")),
-                    }
-                }
-                o.deblock = d;
-            }
+            "--no-loop-filter" => o.no_loop_filter = true,
             _ if a.starts_with("--") => return Err(format!("unknown option {a}")),
             _ => pos.push(a),
         }
@@ -251,7 +228,7 @@ fn run(o: &Opts) -> Result<(), Box<dyn std::error::Error>> {
     let mut dec = bink2::Decoder::new(h)?;
     dec.set_options(bink2::DecoderOptions {
         conceal_slice_errors: o.conceal,
-        deblock: o.deblock,
+        disable_loop_filter: o.no_loop_filter,
         ..Default::default()
     });
     let (mut slices_total, mut slices_sync) = (0usize, 0usize);

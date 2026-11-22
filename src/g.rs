@@ -3,7 +3,8 @@
 use crate::bits::BitReader;
 use crate::dsp::{idct_int, median, write_int_block};
 use crate::error::{Error, Result};
-use crate::tables::{DC_SCALE, QM_G_CHROMA_INTRA, QM_G_INTER, QM_G_LUMA_INTRA, SCAN_G};
+use crate::loop_filter::{intra_strength, BlockInfo};
+use crate::tables::{DC_SCALE, QM_G_CHROMA_INTRA, QM_G_INTER, QM_G_LUMA_INTRA, SCAN_G, ZORDER};
 use crate::video::{
     block_origin, is_chroma, predict_dc, refresh_neighbours, DcNeighbours, FrameCtx, Mv, StoredMb, INTRA, MOTION,
     RESIDUE, SKIP,
@@ -181,11 +182,18 @@ pub(crate) fn read_dc_residuals(br: &mut BitReader, n: usize, q: i32) -> Result<
     Ok(r)
 }
 
-/// Decodes the AC coefficients of a group of 4 blocks (SPEC §4.4).
-pub(crate) fn read_ac_group(br: &mut BitReader, p: u32, q: i32, qm: &[[i32; 64]; 4]) -> Result<[[i16; 64]; 4]> {
+/// Decodes the AC coefficients of a group of 4 blocks (SPEC §4.4). Also returns, per block, the
+/// number of AC levels read (for the loop filter strength, SPEC §4.10).
+pub(crate) fn read_ac_group(
+    br: &mut BitReader,
+    p: u32,
+    q: i32,
+    qm: &[[i32; 64]; 4],
+) -> Result<([[i16; 64]; 4], [u32; 4])> {
     let mut coef = [[0i16; 64]; 4];
+    let mut count = [0u32; 4];
     if p & 0xF == 0 {
-        return Ok(coef);
+        return Ok((coef, count));
     }
     let table = if p >> 16 != 0 { vlc::g_skip1() } else { vlc::g_skip0() };
     let m = &qm[(q & 3) as usize];
@@ -222,10 +230,11 @@ pub(crate) fn read_ac_group(br: &mut BitReader, p: u32, q: i32, qm: &[[i32; 64];
             // Note: the product can overflow 32 bits only for absurd levels at high q, where
             // any wrapping is acceptable (SPEC §4.4). We compute in 64 bits and wrap to int16.
             blk[i] = ((((v * m[i] as i64) << shift) + 64) >> 7) as i16;
+            count[b] += 1;
             pos += 1;
         }
     }
-    Ok(coef)
+    Ok((coef, count))
 }
 
 /// Reads motion vector deltas (SPEC §4.5). Returns (n, deltas).
@@ -370,7 +379,7 @@ fn decode_mb(
                     top: (!top_edge).then_some(t.dc[p]),
                     top_left: (!top_edge && !left_edge).then_some(tl.dc[p]),
                 };
-                decode_plane(
+                let strength = decode_plane(
                     ctx,
                     br,
                     p,
@@ -382,12 +391,21 @@ fn decode_mb(
                     mby,
                     &mut me.dc[p],
                 )?;
+                record_blocks(ctx, p, mbx, mby, |k, _| BlockInfo {
+                    intra: true,
+                    s: strength[k],
+                    dc: me.dc[p][k],
+                    mv: [0, 0],
+                });
             }
         }
         SKIP => {
             me.intra_q = pq_intra;
             me.inter_q = pq_inter;
             ctx.copy_mb(mbx, mby)?;
+            for p in 0..nplanes {
+                record_blocks(ctx, p, mbx, mby, |_, _| BlockInfo::default());
+            }
         }
         _ => {
             me.intra_q = pq_intra;
@@ -403,6 +421,12 @@ fn decode_mb(
             }
             let planes: &[usize] = if ctx.has_alpha { &[0, 1, 2, 3] } else { &[0, 1, 2] };
             ctx.mc_mb(mbx, mby, &me.mv, planes)?;
+            for p in 0..nplanes {
+                record_blocks(ctx, p, mbx, mby, |_, quadrant| BlockInfo {
+                    mv: me.mv[quadrant],
+                    ..BlockInfo::default()
+                });
+            }
             if ty == RESIDUE {
                 let nb = DcNeighbours::none();
                 let q = me.inter_q;
@@ -432,7 +456,25 @@ fn decode_mb(
     Ok(())
 }
 
-/// Codes one plane of one MB (SPEC §4.3).
+/// Records the loop filter info of every block of plane `p` in MB (mbx, mby). `info(k,
+/// quadrant)` gets the block number in coding order and the 16×16 luma quadrant it lies in.
+fn record_blocks(ctx: &mut FrameCtx, p: usize, mbx: usize, mby: usize, info: impl Fn(usize, usize) -> BlockInfo) {
+    let Some(pb) = ctx.blocks.get_mut(p) else { return };
+    let n = if is_chroma(p) { 4 } else { 16 };
+    for (k, &z) in ZORDER.iter().enumerate().take(n) {
+        let (x, y) = block_origin(p, k, mbx, mby);
+        let z = z as usize;
+        let quadrant = if is_chroma(p) {
+            k
+        } else {
+            ((z >> 2) / 2) * 2 + (z & 3) / 2
+        };
+        pb.set(x / 8, y / 8, info(k, quadrant));
+    }
+}
+
+/// Codes one plane of one MB (SPEC §4.3). Returns the loop filter strength `s` of each block
+/// (SPEC §4.10; meaningful for intra blocks).
 #[allow(clippy::too_many_arguments)]
 fn decode_plane(
     ctx: &mut FrameCtx,
@@ -445,7 +487,7 @@ fn decode_plane(
     mbx: usize,
     mby: usize,
     dc: &mut [i32; 16],
-) -> Result<()> {
+) -> Result<[u8; 16]> {
     let chroma = is_chroma(p);
     let cbp = if chroma {
         read_chroma_cbp(br, *cbp_run)?
@@ -455,7 +497,8 @@ fn decode_plane(
     *cbp_run = cbp;
     let n = if chroma { 4 } else { 16 };
     let r = read_dc_residuals(br, n, q)?;
-    let (lo, hi) = if intra { (0, 2047) } else { (-1023, 1023) };
+    // Inter DC range: ±2047 with frame_flags bit 18, else ±1023 (SPEC §4.3, draft 6).
+    let (lo, hi) = inter_dc_range(intra, ctx.frame_flags);
     predict_dc(n, &r, nb, intra, lo, hi, dc);
     let qm = if !intra {
         &QM_G_INTER
@@ -464,20 +507,33 @@ fn decode_plane(
     } else {
         &QM_G_LUMA_INTRA
     };
+    let mut strength = [3u8; 16];
     let Some(plane) = ctx.cur.planes.get_mut(p) else {
-        return Ok(());
+        return Ok(strength);
     };
     for g in 0..n / 4 {
-        let mut coef = read_ac_group(br, cbp >> (4 * g), q, qm)?;
+        let (mut coef, count) = read_ac_group(br, cbp >> (4 * g), q, qm)?;
         for (b, blk) in coef.iter_mut().enumerate() {
             let k = 4 * g + b;
+            strength[k] = intra_strength(cbp & (1 << k) != 0, count[b]);
             blk[0] = (dc[k] * 8 + 32) as i16;
             idct_int(blk);
             let (x, y) = block_origin(p, k, mbx, mby);
             write_int_block(plane, x, y, blk, !intra);
         }
     }
-    Ok(())
+    Ok(strength)
+}
+
+/// DC clamping range (SPEC §4.3).
+pub(crate) fn inter_dc_range(intra: bool, frame_flags: u32) -> (i32, i32) {
+    if intra {
+        (0, 2047)
+    } else if frame_flags & 0x40000 != 0 {
+        (-2047, 2047)
+    } else {
+        (-1023, 1023)
+    }
 }
 
 #[cfg(test)]
@@ -582,7 +638,8 @@ mod tests {
         // Then run symbol 12 ("01") ends the block.
         let d = pack(&["1", "0", "0", "01"]);
         let mut r = BitReader::new(&d);
-        let c = read_ac_group(&mut r, 1, 0, &QM_G_INTER).unwrap();
+        let (c, n) = read_ac_group(&mut r, 1, 0, &QM_G_INTER).unwrap();
+        assert_eq!(n, [1, 0, 0, 0]);
         let i = SCAN_G[1] as usize;
         assert_eq!(c[0][i], ((QM_G_INTER[0][i] + 64) >> 7) as i16);
         assert_eq!(c[0].iter().filter(|&&v| v != 0).count(), 1);
@@ -603,7 +660,8 @@ mod tests {
         parts.push("01");
         let d = pack(&parts);
         let mut r = BitReader::new(&d);
-        let c = read_ac_group(&mut r, 1, 4, &QM_G_INTER).unwrap();
+        let (c, n) = read_ac_group(&mut r, 1, 4, &QM_G_INTER).unwrap();
+        assert_eq!(n[0], 7);
         for &i in &SCAN_G[1..8] {
             let i = i as usize;
             assert_eq!(c[0][i], ((-(QM_G_INTER[0][i] as i64) * 2 + 64) >> 7) as i16);
@@ -664,5 +722,14 @@ mod tests {
         // y components are the negations, and median commutes with negation
         let p = predict_mv(4, &d, false, false, &l, &t, &tl);
         assert_eq!([p[0][1], p[1][1], p[2][1], p[3][1]], [-6, -8, -9, -12]);
+    }
+
+    #[test]
+    fn inter_dc_range_switch() {
+        assert_eq!(inter_dc_range(true, 0), (0, 2047));
+        assert_eq!(inter_dc_range(true, 0x40000), (0, 2047));
+        assert_eq!(inter_dc_range(false, 0), (-1023, 1023));
+        assert_eq!(inter_dc_range(false, 0x40000), (-2047, 2047));
+        assert_eq!(inter_dc_range(false, 0xFFFB_FFFF), (-1023, 1023));
     }
 }

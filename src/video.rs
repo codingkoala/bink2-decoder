@@ -6,6 +6,7 @@ use crate::dsp::{block_dc_from_pixels, ceil_to, clamp, copy_block, mc_chroma, mc
 use crate::edge_flags::read_edge_flags;
 use crate::error::{Error, Result};
 use crate::frame::{FrameBuf, Plane, VideoFrame};
+use crate::loop_filter::{filter_frame, PlaneBlocks};
 use crate::tables::ZORDER;
 
 /// Block (macroblock) types.
@@ -29,52 +30,6 @@ pub enum OutOfRangeMv {
     ClampToPicture,
 }
 
-/// Where the inferred deblocking filter (docs/INFERRED.md) is applied.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum DeblockMode {
-    /// No filter (the behaviour described by SPEC.md).
-    #[default]
-    Off,
-    /// Filter the output only; references stay unfiltered.
-    Post,
-    /// Filter the frame before it is output and used as the next reference.
-    InLoop,
-}
-
-/// Parameters of the inferred deblocking filter. Not part of SPEC.md: a black-box model fitted
-/// to RAD's own output, see docs/INFERRED.md. The defaults (other than `mode`) are the best fit
-/// found: INTRA MBs only, luma and chroma, edge flags respected, no step threshold.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Deblock {
-    /// Where the filter runs.
-    pub mode: DeblockMode,
-    /// Also filter the chroma planes (edges every 8 chroma pixels, using the luma flags of
-    /// the co-located 16-pixel luma edge).
-    pub chroma: bool,
-    /// Filter every edge when the packet carries no edge flags.
-    pub without_flags: bool,
-    /// Leave edges whose step |q0 - p0| is at least this large.
-    pub max_step: i32,
-    /// Filter horizontal edges before vertical ones.
-    pub horizontal_first: bool,
-    /// Bit t set: edges are filtered in MBs of type t (bit 0 INTRA … bit 3 RESIDUE). The MB is
-    /// the one holding the pixel right of / below the edge.
-    pub types: u8,
-}
-
-impl Default for Deblock {
-    fn default() -> Self {
-        Deblock {
-            mode: DeblockMode::Off,
-            chroma: true,
-            without_flags: false,
-            max_step: 256,
-            horizontal_first: false,
-            types: 1,
-        }
-    }
-}
-
 /// Decoder options for the unverified behaviours.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct DecoderOptions {
@@ -84,8 +39,10 @@ pub struct DecoderOptions {
     /// mid-grey without one) and carry on with the next slice instead of failing the frame.
     /// The failure is still recorded in [`Decoder::slice_reports`].
     pub conceal_slice_errors: bool,
-    /// Inferred deblocking filter (off by default).
-    pub deblock: Deblock,
+    /// Switch the in-loop filter of SPEC §4.10 off (for debugging; the output then no longer
+    /// matches RAD's decoder, and P frames drift). The filter runs by default for the integer
+    /// variant; the float variant never runs it (see [`Decoder`]).
+    pub disable_loop_filter: bool,
 }
 
 /// Side information about one decoded macroblock.
@@ -409,6 +366,8 @@ pub(crate) struct FrameCtx<'a> {
     pub fail_mb: Option<(usize, usize)>,
     /// Per-MB side information, raster order.
     pub mb_info: &'a mut [MbInfo],
+    /// Per-plane 8×8 block info for the loop filter (SPEC §4.10).
+    pub blocks: &'a mut [PlaneBlocks],
 }
 
 impl FrameCtx<'_> {
@@ -526,6 +485,9 @@ fn mc_block(
             }
         }
     }
+    // SPEC-QUESTION: the draft 6 corrections of §4.7 (unclipped luma (1,1) intermediate,
+    // one-step chroma bilinear) were checked on integer-variant files only; §5 says the float
+    // variant shares the MC filters, so they are applied to both.
     let ok = if chroma {
         mc_chroma(dst, x, y, src, sx, sy, fx, fy)
     } else {
@@ -537,6 +499,10 @@ fn mc_block(
 }
 
 /// Stateful Bink 2 video decoder.
+///
+/// For the integer variant every frame goes through the in-loop filter of SPEC §4.10 before it
+/// is output and kept as the next reference ([`DecoderOptions::disable_loop_filter`] switches it
+/// off). The float variant is decoded without it.
 #[derive(Debug, Clone)]
 pub struct Decoder {
     revision: u8,
@@ -553,6 +519,7 @@ pub struct Decoder {
     last_frame_flags: u32,
     last_edge_flags: (Option<Vec<bool>>, Option<Vec<bool>>),
     mb_info: Vec<MbInfo>,
+    blocks: Vec<PlaneBlocks>,
 }
 
 impl Decoder {
@@ -584,6 +551,7 @@ impl Decoder {
             last_frame_flags: 0,
             last_edge_flags: (None, None),
             mb_info: Vec::new(),
+            blocks: Vec::new(),
         })
     }
 
@@ -680,7 +648,7 @@ impl Decoder {
         br.seek_byte(4 * s)?;
         let (mut row_flags, mut col_flags) = (None, None);
         if frame_flags & 0x10000 != 0 {
-            // Edge flags (SPEC §3.2 step 5, open question 1).
+            // Edge flags (SPEC §3.2 step 5, §3.3); used by the loop filter (§4.10).
             if frame_flags & 0x8000 == 0 {
                 row_flags = Some(read_edge_flags(br, ceil_to(self.height as u32, 16) as usize / 8 - 1)?);
             }
@@ -716,6 +684,12 @@ impl Decoder {
             .spare
             .take()
             .unwrap_or_else(|| FrameBuf::new(self.aligned_w, self.aligned_h, self.has_alpha));
+        if self.blocks.len() != cur.planes.len() {
+            self.blocks = cur.planes.iter().map(|p| PlaneBlocks::new(p.w / 8, p.h / 8)).collect();
+        }
+        for b in &mut self.blocks {
+            b.reset();
+        }
         {
             let mut ctx = FrameCtx {
                 cur: &mut cur,
@@ -729,6 +703,7 @@ impl Decoder {
                 opts: self.opts,
                 fail_mb: None,
                 mb_info: &mut self.mb_info,
+                blocks: &mut self.blocks,
             };
             let float = is_float_revision(self.revision);
             let mut gstate = crate::g::SliceRows::new(ctx.mb_w);
@@ -766,66 +741,27 @@ impl Decoder {
                 br.seek_byte(hdr.slice_end[i])?;
             }
         }
-        let out = match self.opts.deblock.mode {
-            DeblockMode::Off => {
-                cur.extend_edges();
-                self.output(&cur, keyframe)
-            }
-            DeblockMode::InLoop => {
-                self.apply_deblock(&mut cur);
-                cur.extend_edges();
-                self.output(&cur, keyframe)
-            }
-            DeblockMode::Post => {
-                cur.extend_edges();
-                let mut f = cur.clone();
-                self.apply_deblock(&mut f);
-                self.output(&f, keyframe)
-            }
-        };
+        // SPEC-QUESTION: SPEC §4.10 says it is unverified whether the float variant (revisions
+        // <= f) uses the same loop filter; we leave it off there.
+        if !is_float_revision(self.revision) && !self.opts.disable_loop_filter {
+            filter_frame(
+                &mut cur,
+                &self.blocks,
+                hdr.frame_flags,
+                hdr.row_flags.as_deref(),
+                hdr.col_flags.as_deref(),
+            );
+        }
+        cur.extend_edges();
+        let out = self.output(&cur, keyframe);
         self.spare = self.reference.replace(cur);
         Ok(out)
-    }
-
-    fn apply_deblock(&self, f: &mut FrameBuf) {
-        let d = self.opts.deblock;
-        let (rows, cols) = (self.last_edge_flags.0.as_deref(), self.last_edge_flags.1.as_deref());
-        // Vertical edge at x = 8k uses column flag F[k]; horizontal edge at y = 8k uses row
-        // flag F[k-1] (measured, docs/INFERRED.md). A set flag switches the edge off.
-        let off = |flags: Option<&[bool]>, i: Option<usize>| match (flags, i) {
-            (Some(fl), Some(i)) => fl.get(i).copied().unwrap_or(false),
-            (Some(_), None) => false,
-            (None, _) => !d.without_flags,
-        };
-        let mb_w = self.aligned_w / 32;
-        let info = &self.mb_info;
-        for (p, plane) in f.planes.iter_mut().enumerate() {
-            let chroma = is_chroma(p);
-            let mbs = if chroma { 16 } else { 32 };
-            let pix_on = |x: usize, y: usize| {
-                let t = info.get((y / mbs) * mb_w + x / mbs).map(|m| m.mb_type).unwrap_or(0);
-                d.types & (1 << t) != 0
-            };
-            if chroma && !d.chroma {
-                continue;
-            }
-            let s = if chroma { 2 } else { 1 };
-            let col_off = |k: usize| off(cols, Some(s * k));
-            let row_off = |k: usize| off(rows, (s * k).checked_sub(1));
-            if d.horizontal_first {
-                crate::deblock::filter_plane(plane, false, true, &col_off, &row_off, d.max_step, &pix_on);
-                crate::deblock::filter_plane(plane, true, false, &col_off, &row_off, d.max_step, &pix_on);
-            } else {
-                crate::deblock::filter_plane(plane, true, true, &col_off, &row_off, d.max_step, &pix_on);
-            }
-        }
     }
 
     fn output(&self, f: &FrameBuf, keyframe: bool) -> VideoFrame {
         let (w, h) = (self.width, self.height);
         let (cw, ch) = (w.div_ceil(2), h.div_ceil(2));
-        // SPEC-QUESTION: SPEC §3.1 says the reference writes C1 into Cr (V) and C2 into Cb (U);
-        // we follow that, unverified.
+        // C1 is Cr (V) and C2 is Cb (U) (SPEC §3.1; open question 4 closed).
         VideoFrame {
             width: w,
             height: h,

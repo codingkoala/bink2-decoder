@@ -11,7 +11,7 @@ cargo run --release --example bk2dump -- in.bk2 out.y4m [max_frames]
 
 `bk2dump` prints the header and writes YUV4MPEG2 (`C420jpeg`, alpha dropped).
 
-Unverified spec behaviours are marked `SPEC-QUESTION` in the code. `Decoder::set_options` selects how out-of-picture motion vectors are handled.
+Integer-variant frames go through the in-loop filter of SPEC §4.10 (`DecoderOptions::disable_loop_filter` or `bk2dump --no-loop-filter` switch it off for debugging). Unverified spec behaviours are marked `SPEC-QUESTION` in the code. `Decoder::set_options` selects how out-of-picture motion vectors are handled.
 
 - [docs/SPEC.md](docs/SPEC.md) describes the container and video bitstream.
 - [docs/TABLES.md](docs/TABLES.md) holds the numeric constants.
