@@ -1,6 +1,6 @@
 # Bink 2 video: decoding specification
 
-Status: draft 4 (2026-11-22). Checked against two real `KB2n` files: with the draft-4 fix every slice parses to its exact end, and the pictures match RAD's own output except for the missing deblocking filter (§6, question 1).
+Status: draft 6 (2026-11-22). Checked against two real `KB2n` files (115 and 402 frames, 2560×1440): every slice parses to its exact end, and with the loop filter of §4.10 and the corrections marked "draft 6" the decoded luma matches RAD's own output on every frame of both files (no pixel off by more than the rounding of RAD's RGB export, no drift). Chroma matches within the rounding of the colour conversion.
 
 This document describes the Bink 2 container (`KB2*`) and video bitstream in enough detail to write a decoder. Numeric constants are in [TABLES.md](TABLES.md).
 
@@ -14,6 +14,8 @@ To keep the decoder implementation independent of the LGPL source:
 - answers come back as changes to this document.
 
 This is a process recommendation, not legal advice.
+
+Draft 6 adds behaviour the reference does not have: the loop filter (§4.10), the meaning of several `frame_flags` bits, the edge flag list layout (§3.3) and three corrections (inter DC range, two motion compensation details). These were established for interoperability by analysing the behaviour of RAD's own player (`binkplay.exe` from RAD Video Tools) and checked frame by frame against RAD's output. They are restated here as rules in prose and pseudocode; no code from RAD's player is reproduced.
 
 Where this document says "the reference" it means that FFmpeg decoder. It was never merged, its authors called it imperfect, and it has not been compared with RAD's decoder. Behaviour copied from it may contain its bugs. Those cases are marked **(unverified)**, and [Open questions](#open-questions) collects them.
 
@@ -116,28 +118,37 @@ A frame's keyframe status comes from the index bit, not from the video packet.
 3. Bytes 4 … 4·(S−1)+3: S−1 `u32` values. `slice_end[i]` is the byte offset, from the start of the video packet, where slice i+1 starts. `slice_end[S-1]` = the packet length.
 4. The bit reader starts at byte `4·S`.
 5. If `frame_flags` bit 16 (0x10000) is set:
-   - if bit 15 (0x8000) is clear: read **row flags** with `count = ceil_to(height, 16) / 8 − 1` (§3.3);
-   - then, if bit 14 (0x4000) is clear: read **column flags** with `count = ceil_to(width, 16) / 8 − 1`.
-   The reference parses these flags but never uses them. They probably mark 8-pixel edges for an edge or deblocking filter **(unverified; see open questions)**. A decoder must still parse them to stay in sync.
+   - if bit 15 (0x8000) is clear: read the **row flags** R with `count = ceil_to(height, 16) / 8 − 1` (§3.3);
+   - then, if bit 14 (0x4000) is clear: read the **column flags** C with `count = ceil_to(width, 16) / 8 − 1`.
+   If bit 16 is clear, nothing is read and every flag of a list that is in use (bit 15 resp. bit 14 clear) is 0 (that case does not occur in the test files: there, frames without lists always have bits 14 and 15 set). The flags switch individual edges of the loop filter off (§4.10). *(draft 6)*
+
+   Other `frame_flags` bits used by this document *(draft 6)*:
+
+   | bits | meaning |
+   |---|---|
+   | 0–7 | `smooth_thr = (frame_flags & 0xFF) · 8`, the DC smoothing threshold (§4.10) |
+   | 14 | set: no vertical-edge filtering in this frame (§4.10) |
+   | 15 | set: no horizontal-edge filtering in this frame (§4.10) |
+   | 16 | edge flag lists are coded |
+   | 18 | inter DC range ±2047 instead of ±1023 (§4.3); also used by `read_luma_cbp` (§4.3) |
 6. For each slice i: decode its MB rows (§4 or §5) starting at the current bit position, which is not byte-aligned for slice 0. Then `align()` and move the reader to byte `slice_end[i]`. The reference only warns about over- or under-reads.
 
 ### 3.3 Edge flag lists
 
-This produces a list of `count` + 1 flags F[0] … F[count].
+This produces a list of `count` flags B[0] … B[count−1] *(draft 6: corrected, see the note at the end)*.
 
 ```
 if bit() == 0:                         // raw form
-    F[0 .. count-1] = next count bits (one per flag, in order)
-    F[count] = 0
+    B[0 .. count-1] = next count bits (one per flag, in order)
     done
-F[0] = 0; pos = 1; left = count; mode = NONE; flag = 0
+pos = 0; left = count; mode = NONE; flag = 0
 while left > 0:
     if bit() == 0:                     // literal group
         flag = (mode == TOGGLE) ? 1 - flag : bit()
         mode = LITERAL
         n = min(left, 5)
-        F[pos] = flag
-        F[pos+1 .. pos+n-1] = next n-1 bits
+        B[pos] = flag
+        B[pos+1 .. pos+n-1] = next n-1 bits
         pos += n; left -= n
     else:                              // run
         w = (left < 4) ? 2 : (left < 16) ? 4 : 5
@@ -147,15 +158,13 @@ while left > 0:
             flag = bit();    run = w + 2
         run = min(run, left); left -= run
         if left > 0:
-            extra = bits(w); left -= extra; run += extra
+            extra = min(bits(w), left); left -= extra; run += extra
             mode = (extra == 2^w - 1) ? EXPLICIT : TOGGLE
-        F[pos .. pos+run-1] = flag; pos += run   // may run past count, see below
+        B[pos .. pos+run-1] = flag; pos += run
 ```
-`mode` starts as "not TOGGLE". After a literal group the next flag value is read explicitly. After a run that ended early (extra < max), the next segment's first flag is the opposite of this run's flag.
+`mode` starts as "not TOGGLE". After a literal group the next flag value is read explicitly. After a run that ended early (extra < max), the next segment's first flag is the opposite of this run's flag. A coded `extra` larger than what is left is not an error: it is cut to `left` and the list ends.
 
-If `extra` is larger than what was left, `left` goes negative. That is not an error: the whole run is still produced and the loop ends. Flags past F[count] are discarded, and no further bits are read.
-
-Note the asymmetry: the raw form starts at F[0], the coded form at F[1]. The intended meaning is unknown, so keep both exactly as written.
+Note: the reference writes the coded form from position 1 (with an extra leading 0) but the raw form from position 0. RAD's decoder writes both from position 0, as above; with the reference's layout the flags of the coded form are off by one edge. Only the layout changed; the bits read are the same.
 
 ## 4. Integer variant (revisions `g`+)
 
@@ -254,7 +263,7 @@ Intra vs inter:
 
 | | intra | inter |
 |---|---|---|
-| DC range | 0 … 2047 | −1023 … 1023 |
+| DC range | 0 … 2047 | −1023 … 1023, or −2047 … 2047 if `frame_flags` bit 18 (0x40000) is set *(draft 6)* |
 | DC prediction | uses neighbour MBs (§4.8) | as if both edges were set (only within this MB, starting from 0) |
 | matrices | luma: `G luma intra`; chroma: `G chroma intra` | `G inter` for both |
 | output | overwrite pixels (put) | add to the motion-compensated pixels |
@@ -382,14 +391,19 @@ By fraction:
 - (0,0): copy;
 - (1,0): horizontal filter;
 - (0,1): vertical filter;
-- (1,1): run the horizontal filter on the 21 source rows −2 … +18 (results clipped), then the vertical filter on that intermediate.
+- (1,1): run the horizontal filter on the 21 source rows −2 … +18, then the vertical filter on that intermediate. The intermediate values are **not** clipped: they are `(… + 8) >> 4` as in the formula, without `clip8`, and may be below 0 or above 255. Only the final vertical result is clipped. *(draft 6; the reference clips the intermediate)*
 
 **Chroma filter.** Between samples a and b, at fraction f:
 - f = 1: `(6a + 2b + 4) >> 3`;
 - f = 2: `(a + b + 1) >> 1`;
 - f = 3: `(2a + 6b + 4) >> 3`.
 
-If fy = 0, filter horizontally only (fx = 0 means copy). If fx = 0, filter vertically only. Otherwise filter 9 rows horizontally (clipped), then filter that result vertically.
+If fy = 0, filter horizontally only (fx = 0 means copy). If fx = 0, filter vertically only. Otherwise interpolate in one step, with no rounding in between *(draft 6; the reference rounds after the horizontal pass)*:
+```
+wa(f) = 8 - 2f;  wb(f) = 2f
+h(r)  = wa(fx)·p(x, r) + wb(fx)·p(x+1, r)          // for rows r = y and y+1
+out   = (wa(fy)·h(y) + wb(fy)·h(y+1) + 32) >> 6
+```
 
 The filters and blocks can read past the picture and past the 32-aligned frame. The reference relies on unspecified buffer padding there **(unverified)**. Suggestion: keep reference planes with a margin of at least 32 pixels, filled by edge replication.
 
@@ -443,6 +457,72 @@ Steps:
 2. For each array row r: transform `a[8r … 8r+7]` with `sh = 6`.
 3. Pixel at image (row i, column j) = `a[8j + i]`. The array is **transposed** relative to the image.
 4. Put: `clip8(value)`. Add: `clip8(pixel + value)`.
+
+### 4.10 Loop filter *(draft 6)*
+
+After all slices of a frame are decoded, the frame is filtered **in place**, and the filtered frame is both the output and the reference for the next frame. The filter has three passes per plane, run in this order over the whole plane: DC smoothing, vertical edges, horizontal edges. The planes are Y, C1 and C2. For alpha, only DC smoothing runs, and not at all when `frame_flags` bit 19 (0x80000) is set **(unverified: no test file with alpha)**. The filter works on the whole coded (32-aligned) frame, on 8×8 blocks of each plane (a chroma block is 8×8 chroma pixels).
+
+**Block info.** While decoding, record for every 8×8 block of each plane:
+- `intra`: the block belongs to an INTRA MB;
+- `s`, for intra blocks only: 3 if the block's cbp bit is 0 (no AC coefficients coded); otherwise, with n = the number of AC coefficient values read for the block in §4.4 (each level counts once, the DC does not), `s = (n < 8) + (n < 4) + (n == 0)`, so 0, 1, 2 or 3;
+- `dc`: the block's final DC value from §4.3 (after prediction and clamping), intra blocks only;
+- `mv`: the motion vector of the block's 16×16 luma quadrant (§4.7; the same vector for the co-located chroma blocks), in the coded units (no scaling). SKIP and INTRA MBs have mv (0, 0).
+
+Blocks of SKIP, MOTION and RESIDUE MBs are not intra. For non-intra blocks `s = 0` in the edge rules below.
+
+It helps to pack the info of a block in a 16-bit word, because the smoothing threshold test below compares whole words:
+`word = (intra << 15) | (s << 13) | (dc & 0x1FFF)` for intra blocks, and 0 for the others. Read `word` as a signed 16-bit value where a sign is needed.
+
+**Pass 1: DC smoothing.** For every intra block with `s = 3` (no AC coefficients), replace its 8×8 pixels by a smooth surface through the DCs of its 3×3 neighbourhood:
+```
+c = word of this block (signed 16-bit)
+accept(n) = | wrap16(n - c) | < smooth_thr       // n: neighbour word, signed; wrap16: to signed 16 bits
+g[1][1] = dc of this block
+L, R, T, B (g[1][0], g[1][2], g[0][1], g[2][1]): neighbour's dc if accept(neighbour word) else g[1][1]
+corners g[0][0], g[2][0]: neighbour's dc if accepted else g[1][0]
+corners g[0][2], g[2][2]: neighbour's dc if accepted else g[1][2]
+```
+Because the test compares whole words, only neighbours that are intra with `s = 3` and a DC within `smooth_thr` of this block's DC are used. With `smooth_thr = 0` nothing is accepted and the block becomes flat. Neighbours outside the plane: use this block itself (equivalent to "not accepted") **(observed to match; RAD's exact handling at the left and right plane edges unverified)**.
+
+Then, with these weights (`mulhi(d, k) = (d · k) >> 16`, arithmetic shifts):
+```
+K[0](d) = mulhi(d, 26624)   K[1](d) = mulhi(d, 18432)   K[2](d) = mulhi(d, 12288)   K[3](d) = mulhi(d, 7168)
+K[4](d) = d >> 4            K[5](d) = d >> 5            K[6](d) = d >> 7            K[7](d) = 0
+
+for r in 0, 1, 2:                 // grid row: above, this, below
+    for i in 0 .. 7:
+        H[r][i] = g[r][1] + 4 + K[i](g[r][0] - g[r][1]) + K[7-i](g[r][2] - g[r][1])
+for j in 0 .. 7:                  // pixel row
+    for i in 0 .. 7:              // pixel column
+        v = H[1][i] + K[j](H[0][i] - H[1][i]) + K[7-j](H[2][i] - H[1][i])
+        pixel(i, j) = clip8(v >> 3)
+```
+
+**Edge strength.** For two adjacent blocks A (left or above) and B (right or below):
+```
+sA = A.intra ? A.s : 0;  sB = B.intra ? B.s : 0
+if not A.intra and not B.intra and (|A.mv.x - B.mv.x| >= 2 or |A.mv.y - B.mv.y| >= 2):
+    sA |= 2; sB |= 2
+skip the edge if sA == sB and (sA == 0 or sA == 3)
+```
+
+**Edge filter.** Across the edge, take p1, p0 on A's side (p0 next to the edge) and q0, q1 on B's side, all from the pixels before this edge is filtered:
+```
+d = q0 - p0;  a = (d + 2) >> 2;  b = (d + 4) >> 3
+if sA >= 1: p0' = clip8(p0 + a)
+if sA >= 2: p1' = clip8(p1 + b)
+if sB >= 1: q0' = clip8(q0 - a)
+if sB >= 2: q1' = clip8(q1 - b)
+```
+(Pixels not listed keep their value.) There is no threshold on the step size.
+
+**Pass 2: vertical edges** (skipped if `frame_flags` bit 14 is set). For every block row and every block column bx ≥ 1, filter the edge between blocks bx−1 (A) and bx (B) on all 8 pixel rows of the block, unless the column flag says off: the edge at plane x = 8·bx uses `C[bx − 1]` in luma (and alpha) and `C[2·bx − 1]` in chroma (the flag of the co-located luma edge). A flag value of 1 switches the edge off.
+
+**Pass 3: horizontal edges** (skipped if `frame_flags` bit 15 is set). Same, for every block row by ≥ 1 between blocks above (A) and below (B), on all 8 pixel columns, using `R[by − 1]` in luma and `R[2·by − 1]` in chroma.
+
+Each edge reads the pixels as left by the edges filtered before it in the same pass order (block rows top to bottom, columns left to right). Edges of the same pass never share pixels, so this order only matters between the passes.
+
+**Float variant.** Only checked on integer-variant files. Whether revisions ≤ `f` use the same filter is **unverified**.
 
 ## 5. Float variant (revisions ≤ `f`)
 
@@ -597,13 +677,14 @@ Steps:
 
 Things the reference does not settle, to resolve by testing against real files and, where possible, RAD's own player output:
 
-1. **Deblocking filter (confirmed missing).** Against frames exported by RAD's own converter (RAD Video Tools `BinkConv`), a draft-4 decode of a 2560×1440 `KB2n` file matches in content, but RAD's output is smoothed across 8×8 block edges and ours is not: PSNR is about 29 dB on every frame, and the difference image is concentrated on block edges. So RAD applies an in-loop or post filter on 8-pixel edges that the reference does not describe. The row and column edge flags (§3.3) are the likely per-edge on/off switches. Whether the filter is in-loop (used for prediction) is unknown; the PSNR does not drift over 115 frames, which hints at a post-filter or a small in-loop effect.
+1. **Deblocking filter: closed (draft 6).** It is an in-loop filter with DC smoothing and edge filtering, see §4.10. The edge flags of §3.3 switch single edges off. Still open: the float variant, the alpha plane, and the DC smoothing rule at the left and right plane edges.
 2. **Out-of-picture motion vectors (§4.7).** RAD's behaviour is unknown: skip, clamp or edge-extend. The reference leaves the block undefined.
 3. **Reference padding.** Pixels outside the picture are read by the luma 6-tap filter and by blocks that cross the right or bottom edge.
-4. **Plane order.** Is C1 really Cr?
+4. **Plane order: closed.** C1 is Cr (V) and C2 is Cb (U); checked against RAD's output (swapping gives a blue/cyan cast).
 5. **Float variant:** the alpha MC omission and the `c2` prediction difference (§5.1, §5.4).
 6. **Revisions `a` and `d`.** Accepted by the reference but probably never tested.
-7. **Unknown header fields:** 0x10, the extra field in `i`/`j`/`k`, the other video flags, and the `frame_flags` bits other than 14, 15, 16 and 18.
-8. **Colour matrix and range.** Not signalled anywhere known. BT.601 limited range is a guess.
+7. **Unknown header fields:** 0x10, the extra field in `i`/`j`/`k`, the other video flags, and the `frame_flags` bits not listed in §3.2 (in particular 17, 19 and 24–31, which RAD's player reads but which have no visible effect on the test files).
+8. **Colour conversion: answered for RAD's converter.** RAD Video Tools converts with the BT.601 matrix at **full** range, centred bilinear chroma upsampling and chroma centred on 128.5 (black-box fit, see INFERRED.md on the implementation branch). Using BT.601 limited range instead costs about 7 dB and makes warm content look too saturated.
+11. **P-frame drift: closed (draft 6).** It came from the missing loop filter (§4.10), the edge flag layout (§3.3), the inter DC range (§4.3) and the two motion compensation details (§4.7). With all of them, both test files match RAD on every frame.
 9. **Float bit-exactness.** It depends on IEEE float32 evaluation (no fused multiply-add, no extended precision).
 10. **Bink Audio** (DCT/RDFT) still needs its own spec. It is a separate codec already in mainline FFmpeg (`binkaudio.c`, LGPL), so the same clean-room process applies.
