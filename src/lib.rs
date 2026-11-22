@@ -1,7 +1,8 @@
-//! Clean-room Bink 2 (`.bk2`) video decoder.
+//! Clean-room Bink 2 (`.bk2`) video and audio decoder.
 //!
-//! - [`container`]: file header, audio track table, frame index and frame packets. Audio
-//!   payloads are returned as bytes; Bink Audio is not decoded.
+//! - [`container`]: file header, audio track table, frame index and frame packets.
+//! - [`AudioDecoder`]: Bink Audio (DCT codec, mono or stereo, versions 1 and 2) to interleaved
+//!   16-bit PCM; [`decode_track`] decodes a whole track. The RDFT codec is not supported.
 //! - [`Decoder`]: video decoding to planar 8-bit YUV 4:2:0 (+ optional alpha) for both the
 //!   float variant (revisions `a`, `d`, `f`) and the integer variant (`g` and later).
 //!
@@ -19,6 +20,7 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+pub mod audio;
 pub mod bits;
 pub mod container;
 mod dsp;
@@ -34,6 +36,7 @@ pub mod tables;
 mod video;
 pub mod vlc;
 
+pub use audio::{decode_track, AudioDecoder};
 pub use container::{AudioTrack, Container, FrameEntry, FramePacket, Header};
 pub use error::{Error, Result};
 pub use frame::{VideoFrame, MARGIN};
