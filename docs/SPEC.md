@@ -81,7 +81,7 @@ Some files are wrapped in 512-byte "SMUS" blocks: the file starts with the 4 byt
 ### 2.2 Frame packets
 
 Each frame (from the index) holds, in order:
-1. For each audio track: `u32 size`, then `size` bytes of audio. When `size ≥ 4`, the first `u32` of the audio data is the decoded size in bytes. Audio is a separate codec ("Bink Audio", DCT/RDFT) and is not covered here.
+1. For each audio track: `u32 size`, then `size` bytes of audio. When `size ≥ 4`, the first `u32` of the audio data is the decoded size in bytes. Audio is a separate codec ("Bink Audio", DCT/RDFT), specified in [AUDIO.md](AUDIO.md).
 2. The rest of the frame is the **video packet**.
 
 A frame's keyframe status comes from the index bit, not from the video packet.
@@ -687,4 +687,4 @@ Things the reference does not settle, to resolve by testing against real files a
 8. **Colour conversion: answered for RAD's converter.** RAD Video Tools converts with the BT.601 matrix at **full** range, centred bilinear chroma upsampling and chroma centred on 128.5 (black-box fit, see INFERRED.md on the implementation branch). Using BT.601 limited range instead costs about 7 dB and makes warm content look too saturated.
 11. **P-frame drift: closed (draft 6).** It came from the missing loop filter (§4.10), the edge flag layout (§3.3), the inter DC range (§4.3) and the two motion compensation details (§4.7). With all of them, both test files match RAD on every frame.
 9. **Float bit-exactness.** It depends on IEEE float32 evaluation (no fused multiply-add, no extended precision).
-10. **Bink Audio** (DCT/RDFT) still needs its own spec. It is a separate codec already in mainline FFmpeg (`binkaudio.c`, LGPL), so the same clean-room process applies.
+10. **Bink Audio: see [AUDIO.md](AUDIO.md)** (draft 1, DCT codec checked against RAD).
