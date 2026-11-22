@@ -178,11 +178,17 @@ pub fn write_float_block(p: &mut Plane, x: usize, y: usize, a: &[f32; 64], add: 
 
 // ---------------------------------------------------------------- MC filters (SPEC §4.7)
 
-/// Luma 6-tap half-pel filter on `s[-2] … s[3]` given as `s[0] … s[5]`.
+/// Luma 6-tap half-pel filter on `s[-2] … s[3]` given as `s[0] … s[5]`, without the final
+/// clip (the (1,1) intermediate of SPEC §4.7, draft 6).
+#[inline]
+pub fn luma_tap_raw(s: [i32; 6]) -> i32 {
+    (((19 * (s[2] + s[3])) >> 1) - 2 * (s[1] + s[4]) + ((s[0] + s[5]) >> 1) + 8) >> 4
+}
+
+/// Luma 6-tap half-pel filter, clipped to 8 bits.
 #[inline]
 pub fn luma_tap(s: [i32; 6]) -> u8 {
-    let v = ((19 * (s[2] + s[3])) >> 1) - 2 * (s[1] + s[4]) + ((s[0] + s[5]) >> 1) + 8;
-    clip8(v >> 4)
+    clip8(luma_tap_raw(s))
 }
 
 /// Chroma filter between `a` and `b` at quarter-pel fraction `f` (0 returns `a`).
@@ -256,11 +262,20 @@ pub fn mc_luma(dst: &mut Plane, dx: usize, dy: usize, src: &Plane, sx: i64, sy: 
             }
         }
         _ => {
-            // 21 intermediate rows, source rows -2 … +18.
+            // 21 intermediate rows, source rows -2 … +18. The intermediate is not clipped
+            // (SPEC §4.7, draft 6); only the final vertical result is.
             let mut tmp = [[0i32; N]; N + 5];
             for (r, row) in tmp.iter_mut().enumerate() {
                 for (c, v) in row.iter_mut().enumerate() {
-                    *v = hf(sx + c as i64, sy + r as i64 - 2) as i32;
+                    let (x, y) = (sx + c as i64, sy + r as i64 - 2);
+                    *v = luma_tap_raw([
+                        px(x - 2, y),
+                        px(x - 1, y),
+                        px(x, y),
+                        px(x + 1, y),
+                        px(x + 2, y),
+                        px(x + 3, y),
+                    ]);
                 }
             }
             for r in 0..N {
@@ -303,16 +318,15 @@ pub fn mc_chroma(dst: &mut Plane, dx: usize, dy: usize, src: &Plane, sx: i64, sy
             }
         }
     } else {
-        let mut tmp = [[0i32; N]; N + 1];
-        for (r, row) in tmp.iter_mut().enumerate() {
-            for (c, v) in row.iter_mut().enumerate() {
-                let (x, y) = (sx + c as i64, sy + r as i64);
-                *v = chroma_tap(px(x, y), px(x + 1, y), fx) as i32;
-            }
-        }
+        // One-step bilinear interpolation, no rounding between the passes (SPEC §4.7, draft 6).
+        let (wax, wbx) = (8 - 2 * fx, 2 * fx);
+        let (way, wby) = (8 - 2 * fy, 2 * fy);
         for (r, row) in out.iter_mut().enumerate() {
             for (c, v) in row.iter_mut().enumerate() {
-                *v = chroma_tap(tmp[r][c], tmp[r + 1][c], fy);
+                let (x, y) = (sx + c as i64, sy + r as i64);
+                let h0 = wax * px(x, y) + wbx * px(x + 1, y);
+                let h1 = wax * px(x, y + 1) + wbx * px(x + 1, y + 1);
+                *v = ((way * h0 + wby * h1 + 32) >> 6) as u8;
             }
         }
     }
@@ -492,5 +506,62 @@ mod tests {
         let i = p.idx(0, 0);
         p.data[i] = 101; // avg(101,100)=101, avg(101,100)=101, avg(101,100)=101
         assert_eq!(block_dc_from_pixels(&p, 0, 0), 801);
+    }
+
+    #[test]
+    fn mc_luma_diagonal_intermediate_is_unclipped() {
+        // A high-contrast pattern makes the horizontal half-pel filter overshoot outside
+        // 0..255. Draft 6: the intermediate keeps those values; only the result is clipped.
+        let mut src = Plane::new(32, 32, 0);
+        for y in 0..32 {
+            for x in 0..32 {
+                let i = src.idx(x, y);
+                // pseudo-random high-contrast pattern
+                let h = (x as u32 * 73856093) ^ (y as u32 * 19349663);
+                src.data[i] = if (h >> 7) & 1 == 0 { 255 } else { (h % 64) as u8 };
+            }
+        }
+        src.extend_edges();
+        let mut dst = Plane::new(32, 32, 0);
+        assert!(mc_luma(&mut dst, 0, 0, &src, 4, 4, 1, 1));
+        let px = |x: i64, y: i64| src.data[src.idx(x, y)] as i32;
+        let h = |x: i64, y: i64| luma_tap_raw(std::array::from_fn(|k| px(x - 2 + k as i64, y)));
+        let mut differs = false;
+        for r in 0..16i64 {
+            for c in 0..16i64 {
+                let (x, y) = (4 + c, 4 + r);
+                let col: [i32; 6] = std::array::from_fn(|k| h(x, y - 2 + k as i64));
+                assert_eq!(dst.data[dst.idx(c, r)], luma_tap(col), "({c},{r})");
+                let clipped = col.map(|v| clip8(v) as i32);
+                differs |= luma_tap(clipped) != luma_tap(col);
+            }
+        }
+        assert!(differs, "test pattern must exercise the unclipped intermediate");
+    }
+
+    #[test]
+    fn mc_chroma_two_d_rounds_once() {
+        // p(x, y) = 1 at odd x on even rows, else 0. At fraction (2, 2) from an even position:
+        // h(y) = 4·0 + 4·1 = 4, h(y+1) = 0, out = (4·4 + 4·0 + 32) >> 6 = 0. Rounding after the
+        // horizontal pass (the reference) would give (1 + 0 + 1) >> 1 = 1.
+        let mut src = Plane::new(32, 32, 0);
+        for y in 0..32 {
+            for x in 0..32 {
+                let i = src.idx(x, y);
+                src.data[i] = (x % 2 == 1 && y % 2 == 0) as u8;
+            }
+        }
+        src.extend_edges();
+        let mut dst = Plane::new(16, 16, 9);
+        assert!(mc_chroma(&mut dst, 0, 0, &src, 2, 2, 2, 2));
+        assert_eq!(dst.data[dst.idx(0, 0)], 0);
+        // fractions (1, 3) on a ramp: h = 6a + 2b per row, out = (2·h0 + 6·h1 + 32) >> 6
+        let src = ramp_plane();
+        assert!(mc_chroma(&mut dst, 0, 0, &src, 2, 2, 1, 3));
+        let (h0, h1) = (6 * 12 + 2 * 16, 6 * 14 + 2 * 18);
+        assert_eq!(dst.data[dst.idx(0, 0)] as i32, (2 * h0 + 6 * h1 + 32) >> 6);
+        // one-dimensional cases are unchanged
+        assert!(mc_chroma(&mut dst, 0, 0, &src, 2, 2, 0, 1));
+        assert_eq!(dst.data[dst.idx(0, 0)], chroma_tap(12, 14, 1));
     }
 }
