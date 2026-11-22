@@ -1,6 +1,6 @@
 # Bink 2 video: decoding specification
 
-Status: draft 3 (2026-11-22). Container checked against two real `KB2n` files; video not yet verified.
+Status: draft 4 (2026-11-22). Checked against two real `KB2n` files: with the draft-4 fix every slice parses to its exact end, and the pictures match RAD's own output except for the missing deblocking filter (§6, question 1).
 
 This document describes the Bink 2 container (`KB2*`) and video bitstream in enough detail to write a decoder. Numeric constants are in [TABLES.md](TABLES.md).
 
@@ -199,11 +199,11 @@ store type in current row
 - `LEFT_EDGE` only: the top MB's value;
 - otherwise: median(top, left, top-left).
 
-`read_dq`:
+`read_dq` (draft 1–3 wrongly wrote the second test as a separate `if`, so 3 + 1 also took the 5-bit branch; that desynchronised almost every content slice):
 ```
 n = zeros(4)
-if n == 3: n += bit()
-if n == 4: n += bits(5) + 1
+if n == 3:   n += bit()            // gives 3 or 4
+elif n == 4: n += bits(5) + 1      // only when zeros() returned 4
 if n != 0 and bit(): n = -n
 ```
 
@@ -597,7 +597,7 @@ Steps:
 
 Things the reference does not settle, to resolve by testing against real files and, where possible, RAD's own player output:
 
-1. **Row and column flags (§3.3).** What are they for? Probably an 8-pixel edge or deblocking filter that the reference does not implement. If RAD applies a filter, output will differ along those edges.
+1. **Deblocking filter (confirmed missing).** Against frames exported by RAD's own converter (RAD Video Tools `BinkConv`), a draft-4 decode of a 2560×1440 `KB2n` file matches in content, but RAD's output is smoothed across 8×8 block edges and ours is not: PSNR is about 29 dB on every frame, and the difference image is concentrated on block edges. So RAD applies an in-loop or post filter on 8-pixel edges that the reference does not describe. The row and column edge flags (§3.3) are the likely per-edge on/off switches. Whether the filter is in-loop (used for prediction) is unknown; the PSNR does not drift over 115 frames, which hints at a post-filter or a small in-loop effect.
 2. **Out-of-picture motion vectors (§4.7).** RAD's behaviour is unknown: skip, clamp or edge-extend. The reference leaves the block undefined.
 3. **Reference padding.** Pixels outside the picture are read by the luma 6-tap filter and by blocks that cross the right or bottom edge.
 4. **Plane order.** Is C1 really Cr?
