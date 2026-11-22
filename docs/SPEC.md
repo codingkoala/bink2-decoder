@@ -1,6 +1,6 @@
 # Bink 2 video: decoding specification
 
-Status: draft 6 (2026-11-22). Checked against two real `KB2n` files (115 and 402 frames, 2560×1440): every slice parses to its exact end, and with the loop filter of §4.10 and the corrections marked "draft 6" the decoded luma matches RAD's own output on every frame of both files (no pixel off by more than the rounding of RAD's RGB export, no drift). Chroma matches within the rounding of the colour conversion.
+Status: draft 7 (2026-11-22). Draft 7 fixes two edge cases that only show when the picture size is not a multiple of 32 (§3.2 edge flag counts, §4.7 motion compensation at the picture edge), checked on a third `KB2n` file (720×1280, 651 frames, one keyframe): every frame matches RAD. Draft 6 was checked against two real `KB2n` files (115 and 402 frames, 2560×1440): every slice parses to its exact end, and with the loop filter of §4.10 and the corrections marked "draft 6" the decoded luma matches RAD's own output on every frame of both files (no pixel off by more than the rounding of RAD's RGB export, no drift). Chroma matches within the rounding of the colour conversion.
 
 This document describes the Bink 2 container (`KB2*`) and video bitstream in enough detail to write a decoder. Numeric constants are in [TABLES.md](TABLES.md).
 
@@ -118,8 +118,10 @@ A frame's keyframe status comes from the index bit, not from the video packet.
 3. Bytes 4 … 4·(S−1)+3: S−1 `u32` values. `slice_end[i]` is the byte offset, from the start of the video packet, where slice i+1 starts. `slice_end[S-1]` = the packet length.
 4. The bit reader starts at byte `4·S`.
 5. If `frame_flags` bit 16 (0x10000) is set:
-   - if bit 15 (0x8000) is clear: read the **row flags** R with `count = ceil_to(height, 16) / 8 − 1` (§3.3);
-   - then, if bit 14 (0x4000) is clear: read the **column flags** C with `count = ceil_to(width, 16) / 8 − 1`.
+   - if bit 15 (0x8000) is clear: read the **row flags** R with `count = ceil_to(height, 32) / 8 − 1` (§3.3);
+   - then, if bit 14 (0x4000) is clear: read the **column flags** C with `count = ceil_to(width, 32) / 8 − 1`.
+
+   *(draft 7: 32, not 16. The two agree when the size is a multiple of 32; on a 720-wide file the count must be 91, and 89 desynchronises slice 0 of every frame.)*
    If bit 16 is clear, nothing is read and every flag of a list that is in use (bit 15 resp. bit 14 clear) is 0 (that case does not occur in the test files: there, frames without lists always have bits 14 and 15 set). The flags switch individual edges of the loop filter off (§4.10). *(draft 6)*
 
    Other `frame_flags` bits used by this document *(draft 6)*:
@@ -382,7 +384,7 @@ The same vector values serve both:
 - **Luma:** half-pel units. Source = `(X + (vx >> 1), Y + (vy >> 1))`, fraction = `(vx & 1, vy & 1)`.
 - **Chroma:** quarter-pel units in the chroma plane. Source = `(X + (vx >> 2), Y + (vy >> 2))`, fraction = `(vx & 3, vy & 3)`.
 
-If the source top-left is outside `[0, W) × [0, H)` (W and H = the **visible** picture width and height, not the 32-aligned size, halved with integer division for chroma), the reference **writes nothing** for that block **(unverified; the block keeps undefined content)**. Because of this, even zero-vector blocks that start in the padding right of or below the picture count as out of range.
+Every block is predicted normally, wherever its vector points *(draft 7)*. The reference frame is the whole **coded** frame (32-aligned, including the decoded pixels right of and below the visible picture), and any sample outside it takes the value of the nearest coded sample (edge replication). There is no "out of picture" case. (The reference skips blocks whose source top-left is outside the *visible* picture, including zero-vector blocks in the padding. RAD doesn't: on a 720×1280 file that difference drifts the right edge within 13 frames, while predicting normally matches RAD on all 651 frames.)
 
 **Luma filter.** For six samples `s[-2] … s[3]` around the half-pel position between `s[0]` and `s[1]`:
 `h = clip8(( ((19·(s0 + s1)) >> 1) − 2·(s−1 + s2) + ((s−2 + s3) >> 1) + 8 ) >> 4)`
@@ -405,7 +407,7 @@ h(r)  = wa(fx)·p(x, r) + wb(fx)·p(x+1, r)          // for rows r = y and y+1
 out   = (wa(fy)·h(y) + wb(fy)·h(y+1) + 32) >> 6
 ```
 
-The filters and blocks can read past the picture and past the 32-aligned frame. The reference relies on unspecified buffer padding there **(unverified)**. Suggestion: keep reference planes with a margin of at least 32 pixels, filled by edge replication.
+The filters and blocks can read past the 32-aligned frame. A margin of 32 replicated pixels around each reference plane covers the vectors seen in the test files; a decoder may clamp coordinates instead, which is the same thing. *(draft 7)*
 
 ### 4.8 DC prediction and neighbour refresh
 
@@ -678,8 +680,8 @@ Steps:
 Things the reference does not settle, to resolve by testing against real files and, where possible, RAD's own player output:
 
 1. **Deblocking filter: closed (draft 6).** It is an in-loop filter with DC smoothing and edge filtering, see §4.10. The edge flags of §3.3 switch single edges off. Still open: the float variant, the alpha plane, and the DC smoothing rule at the left and right plane edges.
-2. **Out-of-picture motion vectors (§4.7).** RAD's behaviour is unknown: skip, clamp or edge-extend. The reference leaves the block undefined.
-3. **Reference padding.** Pixels outside the picture are read by the luma 6-tap filter and by blocks that cross the right or bottom edge.
+2. **Out-of-picture motion vectors (§4.7): closed (draft 7).** Predict normally from the coded frame with edge replication.
+3. **Reference padding: closed (draft 7).** See §4.7.
 4. **Plane order: closed.** C1 is Cr (V) and C2 is Cb (U); checked against RAD's output (swapping gives a blue/cyan cast).
 5. **Float variant:** the alpha MC omission and the `c2` prediction difference (§5.1, §5.4).
 6. **Revisions `a` and `d`.** Accepted by the reference but probably never tested.
