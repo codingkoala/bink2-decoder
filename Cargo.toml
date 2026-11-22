@@ -1,0 +1,12 @@
+[package]
+name = "bink2"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "Clean-room Bink 2 (.bk2) video decoder"
+repository = "https://github.com/codingkoala/bink2-decoder"
+readme = "README.md"
+
+[dependencies]
+
+[dev-dependencies]
