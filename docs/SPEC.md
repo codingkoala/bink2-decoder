@@ -1,6 +1,6 @@
 # Bink 2 video: decoding specification
 
-Status: draft 4 (2026-11-22). Checked against two real `KB2n` files: with the draft-4 fix every slice parses to its exact end, and the pictures match RAD's own output except for the missing deblocking filter (§6, question 1).
+Status: draft 5 (2026-11-22). Checked against two real `KB2n` files: with the draft-4 fix every slice parses to its exact end, and the pictures match RAD's own output except for the missing deblocking filter (§6, question 1).
 
 This document describes the Bink 2 container (`KB2*`) and video bitstream in enough detail to write a decoder. Numeric constants are in [TABLES.md](TABLES.md).
 
@@ -600,10 +600,11 @@ Things the reference does not settle, to resolve by testing against real files a
 1. **Deblocking filter (confirmed missing).** Against frames exported by RAD's own converter (RAD Video Tools `BinkConv`), a draft-4 decode of a 2560×1440 `KB2n` file matches in content, but RAD's output is smoothed across 8×8 block edges and ours is not: PSNR is about 29 dB on every frame, and the difference image is concentrated on block edges. So RAD applies an in-loop or post filter on 8-pixel edges that the reference does not describe. The row and column edge flags (§3.3) are the likely per-edge on/off switches. Whether the filter is in-loop (used for prediction) is unknown; the PSNR does not drift over 115 frames, which hints at a post-filter or a small in-loop effect.
 2. **Out-of-picture motion vectors (§4.7).** RAD's behaviour is unknown: skip, clamp or edge-extend. The reference leaves the block undefined.
 3. **Reference padding.** Pixels outside the picture are read by the luma 6-tap filter and by blocks that cross the right or bottom edge.
-4. **Plane order.** Is C1 really Cr?
+4. **Plane order: closed.** C1 is Cr (V) and C2 is Cb (U); checked against RAD's output (swapping gives a blue/cyan cast).
 5. **Float variant:** the alpha MC omission and the `c2` prediction difference (§5.1, §5.4).
 6. **Revisions `a` and `d`.** Accepted by the reference but probably never tested.
 7. **Unknown header fields:** 0x10, the extra field in `i`/`j`/`k`, the other video flags, and the `frame_flags` bits other than 14, 15, 16 and 18.
-8. **Colour matrix and range.** Not signalled anywhere known. BT.601 limited range is a guess.
+8. **Colour conversion: answered for RAD's converter.** RAD Video Tools converts with the BT.601 matrix at **full** range, centred bilinear chroma upsampling and chroma centred on 128.5 (black-box fit, see INFERRED.md on the implementation branch). Using BT.601 limited range instead costs about 7 dB and makes warm content look too saturated.
+11. **P-frame drift.** With the colour conversion fixed, keyframes reach about 45–48 dB against RAD, but P frames lose a little each frame (about 52 dB luma one-step, down to 34–36 dB after 60–100 frames). Motion compensation or inter residuals differ slightly from RAD; source unknown. A missing in-loop deblocking filter (question 1) is the main suspect.
 9. **Float bit-exactness.** It depends on IEEE float32 evaluation (no fused multiply-add, no extended precision).
 10. **Bink Audio** (DCT/RDFT) still needs its own spec. It is a separate codec already in mainline FFmpeg (`binkaudio.c`, LGPL), so the same clean-room process applies.
