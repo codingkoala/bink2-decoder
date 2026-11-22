@@ -71,3 +71,14 @@ That is the RGB rounding floor on every frame, with no drift. Without the loop f
 
 - `bk2dump --report` prints per-slice bit accounting. `--side FILE` writes frame flags, edge flags, MB types and q per frame, `--no-loop-filter` switches the SPEC §4.10 filter off, and `--png` writes frames with the conversion of §1.
 - `bk2onestep` decodes one P frame against an externally supplied reference.
+
+## 6. Audio implementation: spec questions (AUDIO.md draft 1)
+
+Raised while implementing `src/audio.rs` from AUDIO.md only.
+
+1. **Precision (§3.3).** AUDIO.md says single precision is enough. On the test file (`movies_video_002`, track 0) an f32 transform gives 99.897 % identical samples (max difference 1), just under the 99.92 % of the status line; computing coefficients, transform and gain in f64 gives 99.920 % (1,285,374 of 1,286,400), max difference 1. The crate uses f64. Should §3.3 say double precision, or name 99.9 % as the f32 expectation?
+2. **Final alignment (§3.1).** What if the 32-bit boundary after the last block lies past the end of the payload (payload length after `decoded_bytes` not a multiple of 4)? The crate treats the block as complete and stops. A block that runs out of bits before its end is an error.
+3. **Trailing bits (§3).** "The payload has bits left" is the loop condition, so any non-zero number of trailing bits starts a new block (and usually fails as truncated). Is zero padding of 32 bits or more possible after the last block?
+4. **`decoded_bytes` (§1).** Not used for decoding. On the test file every packet's output matches it exactly. Should a decoder check it, or trim or pad its output to it?
+5. **Version selection (§2).** Implemented as revision ≥ `n` → version 2. Revisions `l`/`m` (no samples) would be version 1 by the literal reading.
+6. **More than 2 channels (§2).** The track flags only give mono or stereo, so it is unclear how a track with more channels would be signalled; the crate cannot see one and does not check for it.
