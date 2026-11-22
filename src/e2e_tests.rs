@@ -2,7 +2,7 @@
 
 use crate::container::tests::build_file;
 use crate::container::Container;
-use crate::{Decoder, Error};
+use crate::{Decoder, DecoderOptions, Error, OutOfRangeMv};
 
 /// LSB-first bit writer.
 #[derive(Default)]
@@ -179,6 +179,12 @@ fn g_p_frames_skip_motion_residue() {
 #[test]
 fn g_out_of_range_motion_copies_colocated() {
     let mut dec = Decoder::with_params(b'g', 32, 32, 0).unwrap();
+    // The default is now OutOfRangeMv::Predict (SPEC §4.7 draft 7); this test checks the
+    // experimental CopyColocated policy, so ask for it explicitly.
+    dec.set_options(DecoderOptions {
+        out_of_range_mv: OutOfRangeMv::CopyColocated,
+        ..DecoderOptions::default()
+    });
     dec.decode(&g_keyframe_dc(), true).unwrap();
     // MOTION, one vector: x = escape. zeros(12) = 0 -> w = 4, u = bits(4) + 15 = 30 -> 15
     // half-pels... use a large one: zeros = 12 -> w = 16, u = 65535 + bits(16) -> far outside.

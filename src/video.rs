@@ -21,12 +21,14 @@ pub(crate) type Mv = [i32; 2];
 /// What to do when a motion vector points outside the picture (SPEC §4.7, open question 2).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum OutOfRangeMv {
-    /// Leave the destination block as a copy of the co-located reference block.
-    // SPEC-QUESTION: the reference writes nothing for such blocks (undefined content). The
-    // default here copies the co-located reference block instead.
+    /// Predict normally from the coded (32-aligned) reference frame with edge replication, as RAD does (SPEC §4.7 draft 7).
     #[default]
+    Predict,
+    /// Alternative to RAD's behaviour, kept for experiments: leave the destination block as a
+    /// copy of the co-located reference block.
     CopyColocated,
-    /// Clamp the source top-left into the picture and predict from there.
+    /// Alternative to RAD's behaviour, kept for experiments: clamp the source top-left into the
+    /// picture and predict from there.
     ClampToPicture,
 }
 
@@ -470,11 +472,11 @@ fn mc_block(
     chroma: bool,
     policy: OutOfRangeMv,
 ) {
-    // W and H are the visible picture size, not the 32-aligned size (SPEC §4.7), so even
-    // zero-vector blocks starting in the padding right of or below the picture are outside.
-    let outside = sx < 0 || sx >= w || sy < 0 || sy >= h;
+    // SPEC §4.7 draft 7: RAD predicts every block from the coded frame; the visible-size check only applies to the experimental policies.
+    let outside = policy != OutOfRangeMv::Predict && (sx < 0 || sx >= w || sy < 0 || sy >= h);
     if outside {
         match policy {
+            OutOfRangeMv::Predict => {} // unreachable: `outside` is false for Predict
             OutOfRangeMv::CopyColocated => {
                 copy_block(dst, x, y, src, x as i64, y as i64, bs);
                 return;
@@ -649,11 +651,12 @@ impl Decoder {
         let (mut row_flags, mut col_flags) = (None, None);
         if frame_flags & 0x10000 != 0 {
             // Edge flags (SPEC §3.2 step 5, §3.3); used by the loop filter (§4.10).
+            // SPEC §3.2 draft 7: counts use the 32-aligned size
             if frame_flags & 0x8000 == 0 {
-                row_flags = Some(read_edge_flags(br, ceil_to(self.height as u32, 16) as usize / 8 - 1)?);
+                row_flags = Some(read_edge_flags(br, ceil_to(self.height as u32, 32) as usize / 8 - 1)?);
             }
             if frame_flags & 0x4000 == 0 {
-                col_flags = Some(read_edge_flags(br, ceil_to(self.width as u32, 16) as usize / 8 - 1)?);
+                col_flags = Some(read_edge_flags(br, ceil_to(self.width as u32, 32) as usize / 8 - 1)?);
             }
         }
         Ok(PacketHeader {

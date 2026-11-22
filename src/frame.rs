@@ -1,8 +1,7 @@
 //! Frame buffers with an edge-replicated margin, and the public output frame.
 
 /// Margin around every reference plane, in pixels.
-// SPEC-QUESTION: SPEC §4.7 leaves reference padding undefined. We keep a 32-pixel margin on
-// every side, filled by replicating the edge pixels of the coded (32-aligned) frame.
+// SPEC §4.7 draft 7: samples outside the coded (32-aligned) frame replicate its edge pixels.
 pub const MARGIN: usize = 32;
 
 /// One 8-bit plane covering the coded (aligned) area plus `MARGIN` on every side.
