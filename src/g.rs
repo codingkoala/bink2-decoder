@@ -101,8 +101,8 @@ pub(crate) fn read_dq(br: &mut BitReader) -> Result<i32> {
     let mut n = br.zeros(4)? as i32;
     if n == 3 {
         n += br.bit()? as i32;
-    }
-    if n == 4 {
+    } else if n == 4 {
+        // Only when zeros() returned 4 (SPEC draft 4; drafts 1-3 had a separate `if`).
         n += br.bits(5)? as i32 + 1;
     }
     if n != 0 && br.bit()? {
@@ -500,13 +500,25 @@ mod tests {
             (&["01", "1"], -1),
             (&["001", "1"], -2),
             (&["0001", "0", "0"], 3),
-            (&["0001", "1", "00000", "0"], 5),
+            (&["0000", "00000", "0"], 5),
             (&["0000", "11111", "1"], -36),
         ];
         for (bits, want) in cases {
             let d = pack(bits);
             assert_eq!(read_dq(&mut BitReader::new(&d)).unwrap(), *want, "{bits:?}");
         }
+    }
+
+    #[test]
+    fn dq_three_plus_one_is_four_without_escape() {
+        // Regression (SPEC draft 4): "0001 1 0" is zeros = 3, +1 = 4, sign 0: +4 in 6 bits.
+        // Drafts 1-3 also read the 5-bit escape here, which desynchronised real streams.
+        let d = pack(&["0001", "1", "0", "11111"]);
+        let mut r = BitReader::new(&d);
+        assert_eq!(read_dq(&mut r).unwrap(), 4);
+        assert_eq!(r.position(), 6);
+        let d = pack(&["0001", "1", "1"]);
+        assert_eq!(read_dq(&mut BitReader::new(&d)).unwrap(), -4);
     }
 
     #[test]
