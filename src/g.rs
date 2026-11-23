@@ -352,7 +352,7 @@ fn decode_mb(
     rows.cur[mbx].ty = ty;
     let nplanes = if ctx.has_alpha { 4 } else { 3 };
     if ty == INTRA {
-        refresh_neighbours(ctx.cur, &mut rows.cur, &mut rows.prev, mbx, mby, top_edge, nplanes);
+        refresh_neighbours(&ctx.cur, &mut rows.cur, &mut rows.prev, mbx, mby, top_edge, nplanes);
     }
     let zero = Mb::default();
     let l = if left_edge { zero } else { rows.cur[mbx - 1] };
@@ -446,13 +446,15 @@ fn decode_mb(
             }
         }
     }
-    if let Some(info) = ctx.mb_info.get_mut(mby * ctx.mb_w + mbx) {
-        *info = crate::video::MbInfo {
+    ctx.set_mb_info(
+        mbx,
+        mby,
+        crate::video::MbInfo {
             mb_type: ty,
             intra_q: me.intra_q,
             inter_q: me.inter_q,
-        };
-    }
+        },
+    );
     rows.cur[mbx] = me;
     Ok(())
 }
@@ -509,7 +511,7 @@ fn decode_plane(
         &QM_G_LUMA_INTRA
     };
     let mut strength = [3u8; 16];
-    let Some(plane) = ctx.cur.planes.get_mut(p) else {
+    let Some(plane) = ctx.cur.get_mut(p) else {
         return Ok(strength);
     };
     for g in 0..n / 4 {

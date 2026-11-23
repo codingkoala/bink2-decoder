@@ -1,6 +1,6 @@
 //! Arithmetic helpers, inverse transforms, motion compensation filters and block copies.
 
-use crate::frame::Plane;
+use crate::frame::{Plane, PlaneBand};
 
 /// `clip8(v)` = `min(max(v, 0), 255)`.
 #[inline]
@@ -107,7 +107,7 @@ pub fn idct_int(a: &mut [i16; 64]) {
 
 /// Writes an integer-IDCT output block (transposed layout) at (x, y), either replacing (`add`
 /// false) or adding to the pixels. The caller guarantees the block lies in the coded area.
-pub fn write_int_block(p: &mut Plane, x: usize, y: usize, a: &[i16; 64], add: bool) {
+pub fn write_int_block(p: &mut PlaneBand, x: usize, y: usize, a: &[i16; 64], add: bool) {
     for i in 0..8 {
         let base = p.idx(x as i64, (y + i) as i64);
         for j in 0..8 {
@@ -160,7 +160,7 @@ pub fn idct_float(a: &mut [f32; 64]) {
 
 /// Writes a float-IDCT output block at (x, y): put `clip8(trunc(a − 512))` or add
 /// `clip8(trunc(pixel + a − 512))`.
-pub fn write_float_block(p: &mut Plane, x: usize, y: usize, a: &[f32; 64], add: bool) {
+pub fn write_float_block(p: &mut PlaneBand, x: usize, y: usize, a: &[f32; 64], add: bool) {
     for r in 0..8 {
         let base = p.idx(x as i64, (y + r) as i64);
         for c in 0..8 {
@@ -204,7 +204,7 @@ pub fn chroma_tap(a: i32, b: i32, f: i32) -> u8 {
 
 /// Copies a `size × size` block from `src` at (sx, sy) to `dst` at (dx, dy). Returns false (and
 /// writes nothing) if the source rectangle is outside the padded reference.
-pub fn copy_block(dst: &mut Plane, dx: usize, dy: usize, src: &Plane, sx: i64, sy: i64, size: usize) -> bool {
+pub fn copy_block(dst: &mut PlaneBand, dx: usize, dy: usize, src: &Plane, sx: i64, sy: i64, size: usize) -> bool {
     if !src.contains(sx, sy, size, size) {
         return false;
     }
@@ -219,7 +219,7 @@ pub fn copy_block(dst: &mut Plane, dx: usize, dy: usize, src: &Plane, sx: i64, s
 /// Luma (and alpha) 16×16 half-pel prediction from integer source (sx, sy) with fraction
 /// (fx, fy) ∈ {0,1}². Returns false (nothing written) if the reads leave the padded reference.
 #[allow(clippy::too_many_arguments)]
-pub fn mc_luma(dst: &mut Plane, dx: usize, dy: usize, src: &Plane, sx: i64, sy: i64, fx: i32, fy: i32) -> bool {
+pub fn mc_luma(dst: &mut PlaneBand, dx: usize, dy: usize, src: &Plane, sx: i64, sy: i64, fx: i32, fy: i32) -> bool {
     const N: usize = 16;
     if !src.contains(sx - 2, sy - 2, N + 5, N + 5) {
         return false;
@@ -293,7 +293,7 @@ pub fn mc_luma(dst: &mut Plane, dx: usize, dy: usize, src: &Plane, sx: i64, sy: 
 /// Chroma 8×8 quarter-pel prediction from integer source (sx, sy) with fraction (fx, fy) ∈ 0..4.
 /// Returns false (nothing written) if the reads leave the padded reference.
 #[allow(clippy::too_many_arguments)]
-pub fn mc_chroma(dst: &mut Plane, dx: usize, dy: usize, src: &Plane, sx: i64, sy: i64, fx: i32, fy: i32) -> bool {
+pub fn mc_chroma(dst: &mut PlaneBand, dx: usize, dy: usize, src: &Plane, sx: i64, sy: i64, fx: i32, fy: i32) -> bool {
     const N: usize = 8;
     if !src.contains(sx, sy, N + 1, N + 1) {
         return false;
@@ -338,7 +338,7 @@ pub fn mc_chroma(dst: &mut Plane, dx: usize, dy: usize, src: &Plane, sx: i64, sy
 }
 
 /// DC of an 8×8 block recomputed from pixels (SPEC §4.8 neighbour refresh).
-pub fn block_dc_from_pixels(p: &Plane, x: usize, y: usize) -> i32 {
+pub fn block_dc_from_pixels(p: &PlaneBand, x: usize, y: usize) -> i32 {
     let avg = |a: i32, b: i32| (a + b + 1) >> 1;
     let mut sum = 0;
     for c in 0..8 {
@@ -404,12 +404,12 @@ mod tests {
             }
         }
         let mut p = Plane::new(32, 32, 128);
-        write_int_block(&mut p, 8, 0, &a, true);
+        write_int_block(&mut p.band(), 8, 0, &a, true);
         let row0: Vec<u8> = (0..8).map(|c| p.data[p.idx(8 + c, 0)]).collect();
         assert_eq!(row0, [129, 129, 128, 128, 127, 127, 127, 126]);
         let row5: Vec<u8> = (0..8).map(|c| p.data[p.idx(8 + c, 5)]).collect();
         assert_eq!(row0, row5);
-        write_int_block(&mut p, 8, 0, &a, false);
+        write_int_block(&mut p.band(), 8, 0, &a, false);
         assert_eq!(p.data[p.idx(8, 0)], 1);
         assert_eq!(p.data[p.idx(15, 0)], 0);
     }
@@ -421,7 +421,7 @@ mod tests {
             a[0] = dc * 0.125;
             idct_float(&mut a);
             let mut p = Plane::new(16, 16, 0);
-            write_float_block(&mut p, 0, 0, &a, false);
+            write_float_block(&mut p.band(), 0, 0, &a, false);
             let want = clip8((dc * 0.125 + 0.5) as i32);
             for r in 0..8 {
                 for c in 0..8 {
@@ -433,7 +433,7 @@ mod tests {
         let mut a = [0f32; 64];
         idct_float(&mut a);
         let mut p = Plane::new(16, 16, 77);
-        write_float_block(&mut p, 0, 0, &a, true);
+        write_float_block(&mut p.band(), 0, 0, &a, true);
         assert_eq!(p.data[p.idx(3, 3)], 77);
     }
 
@@ -474,38 +474,38 @@ mod tests {
         // On a linear ramp the 6-tap filter gives the exact midpoint (+ rounding).
         let src = ramp_plane();
         let mut dst = Plane::new(32, 32, 0);
-        assert!(mc_luma(&mut dst, 0, 0, &src, 4, 4, 0, 0));
+        assert!(mc_luma(&mut dst.band(), 0, 0, &src, 4, 4, 0, 0));
         assert_eq!(dst.data[dst.idx(0, 0)], 24);
-        assert!(mc_luma(&mut dst, 0, 0, &src, 4, 4, 1, 0));
+        assert!(mc_luma(&mut dst.band(), 0, 0, &src, 4, 4, 1, 0));
         assert_eq!(dst.data[dst.idx(0, 0)], 26);
-        assert!(mc_luma(&mut dst, 0, 0, &src, 4, 4, 0, 1));
+        assert!(mc_luma(&mut dst.band(), 0, 0, &src, 4, 4, 0, 1));
         assert_eq!(dst.data[dst.idx(0, 0)], 25);
-        assert!(mc_luma(&mut dst, 0, 0, &src, 4, 4, 1, 1));
+        assert!(mc_luma(&mut dst.band(), 0, 0, &src, 4, 4, 1, 1));
         assert_eq!(dst.data[dst.idx(0, 0)], 27);
         assert_eq!(dst.data[dst.idx(1, 2)], 27 + 4 + 4);
         // reads beyond the margin are refused
-        assert!(!mc_luma(&mut dst, 0, 0, &src, 60, 0, 1, 0));
+        assert!(!mc_luma(&mut dst.band(), 0, 0, &src, 60, 0, 1, 0));
     }
 
     #[test]
     fn mc_chroma_on_ramp() {
         let src = ramp_plane();
         let mut dst = Plane::new(16, 16, 0);
-        assert!(mc_chroma(&mut dst, 0, 0, &src, 2, 2, 1, 0));
+        assert!(mc_chroma(&mut dst.band(), 0, 0, &src, 2, 2, 1, 0));
         assert_eq!(dst.data[dst.idx(0, 0)], 13); // (6*12 + 2*16 + 4) >> 3
-        assert!(mc_chroma(&mut dst, 0, 0, &src, 2, 2, 0, 2));
+        assert!(mc_chroma(&mut dst.band(), 0, 0, &src, 2, 2, 0, 2));
         assert_eq!(dst.data[dst.idx(0, 0)], 13); // (12 + 14 + 1) >> 1
-        assert!(mc_chroma(&mut dst, 0, 0, &src, 2, 2, 2, 2));
+        assert!(mc_chroma(&mut dst.band(), 0, 0, &src, 2, 2, 2, 2));
         assert_eq!(dst.data[dst.idx(0, 0)], 15); // h: 14 and 16, then (14+16+1)>>1
     }
 
     #[test]
     fn dc_from_pixels() {
         let mut p = Plane::new(16, 16, 100);
-        assert_eq!(block_dc_from_pixels(&p, 0, 0), 800);
+        assert_eq!(block_dc_from_pixels(&p.band(), 0, 0), 800);
         let i = p.idx(0, 0);
         p.data[i] = 101; // avg(101,100)=101, avg(101,100)=101, avg(101,100)=101
-        assert_eq!(block_dc_from_pixels(&p, 0, 0), 801);
+        assert_eq!(block_dc_from_pixels(&p.band(), 0, 0), 801);
     }
 
     #[test]
@@ -523,7 +523,7 @@ mod tests {
         }
         src.extend_edges();
         let mut dst = Plane::new(32, 32, 0);
-        assert!(mc_luma(&mut dst, 0, 0, &src, 4, 4, 1, 1));
+        assert!(mc_luma(&mut dst.band(), 0, 0, &src, 4, 4, 1, 1));
         let px = |x: i64, y: i64| src.data[src.idx(x, y)] as i32;
         let h = |x: i64, y: i64| luma_tap_raw(std::array::from_fn(|k| px(x - 2 + k as i64, y)));
         let mut differs = false;
@@ -553,15 +553,15 @@ mod tests {
         }
         src.extend_edges();
         let mut dst = Plane::new(16, 16, 9);
-        assert!(mc_chroma(&mut dst, 0, 0, &src, 2, 2, 2, 2));
+        assert!(mc_chroma(&mut dst.band(), 0, 0, &src, 2, 2, 2, 2));
         assert_eq!(dst.data[dst.idx(0, 0)], 0);
         // fractions (1, 3) on a ramp: h = 6a + 2b per row, out = (2·h0 + 6·h1 + 32) >> 6
         let src = ramp_plane();
-        assert!(mc_chroma(&mut dst, 0, 0, &src, 2, 2, 1, 3));
+        assert!(mc_chroma(&mut dst.band(), 0, 0, &src, 2, 2, 1, 3));
         let (h0, h1) = (6 * 12 + 2 * 16, 6 * 14 + 2 * 18);
         assert_eq!(dst.data[dst.idx(0, 0)] as i32, (2 * h0 + 6 * h1 + 32) >> 6);
         // one-dimensional cases are unchanged
-        assert!(mc_chroma(&mut dst, 0, 0, &src, 2, 2, 0, 1));
+        assert!(mc_chroma(&mut dst.band(), 0, 0, &src, 2, 2, 0, 1));
         assert_eq!(dst.data[dst.idx(0, 0)], chroma_tap(12, 14, 1));
     }
 }
