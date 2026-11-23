@@ -651,9 +651,10 @@ impl Decoder {
         let (mut row_flags, mut col_flags) = (None, None);
         if frame_flags & 0x10000 != 0 {
             // Edge flags (SPEC §3.2 step 5, §3.3); used by the loop filter (§4.10).
-            // SPEC §3.2 draft 7: counts use the 32-aligned size
+            // SPEC §3.2 draft 7: the row count uses the 16-aligned height, the column count the
+            // 32-aligned width
             if frame_flags & 0x8000 == 0 {
-                row_flags = Some(read_edge_flags(br, ceil_to(self.height as u32, 32) as usize / 8 - 1)?);
+                row_flags = Some(read_edge_flags(br, ceil_to(self.height as u32, 16) as usize / 8 - 1)?);
             }
             if frame_flags & 0x4000 == 0 {
                 col_flags = Some(read_edge_flags(br, ceil_to(self.width as u32, 32) as usize / 8 - 1)?);

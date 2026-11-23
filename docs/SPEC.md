@@ -118,10 +118,10 @@ A frame's keyframe status comes from the index bit, not from the video packet.
 3. Bytes 4 … 4·(S−1)+3: S−1 `u32` values. `slice_end[i]` is the byte offset, from the start of the video packet, where slice i+1 starts. `slice_end[S-1]` = the packet length.
 4. The bit reader starts at byte `4·S`.
 5. If `frame_flags` bit 16 (0x10000) is set:
-   - if bit 15 (0x8000) is clear: read the **row flags** R with `count = ceil_to(height, 32) / 8 − 1` (§3.3);
+   - if bit 15 (0x8000) is clear: read the **row flags** R with `count = ceil_to(height, 16) / 8 − 1` (§3.3);
    - then, if bit 14 (0x4000) is clear: read the **column flags** C with `count = ceil_to(width, 32) / 8 − 1`.
 
-   *(draft 7: 32, not 16. The two agree when the size is a multiple of 32; on a 720-wide file the count must be 91, and 89 desynchronises slice 0 of every frame.)*
+   *(draft 7: the column count uses 32, not 16; on a 720-wide file it must be 91, and 89 desynchronises slice 0 of every frame. The row count uses 16: on a 720-high file it must be 89, and 91 desynchronises every frame. 2160-high files need 269, not 271. The two roundings agree whenever the size is a multiple of 32, and at 1080.)*
    If bit 16 is clear, nothing is read and every flag of a list that is in use (bit 15 resp. bit 14 clear) is 0 (that case does not occur in the test files: there, frames without lists always have bits 14 and 15 set). The flags switch individual edges of the loop filter off (§4.10). *(draft 6)*
 
    Other `frame_flags` bits used by this document *(draft 6)*:
