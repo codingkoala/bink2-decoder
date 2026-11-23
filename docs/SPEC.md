@@ -1,6 +1,6 @@
 # Bink 2 video: decoding specification
 
-Status: draft 7 (2026-11-22). Draft 7 fixes two edge cases that only show when the picture size is not a multiple of 32 (§3.2 edge flag counts, §4.7 motion compensation at the picture edge), checked on a third `KB2n` file (720×1280, 651 frames, one keyframe): every frame matches RAD. Draft 6 was checked against two real `KB2n` files (115 and 402 frames, 2560×1440): every slice parses to its exact end, and with the loop filter of §4.10 and the corrections marked "draft 6" the decoded luma matches RAD's own output on every frame of both files (no pixel off by more than the rounding of RAD's RGB export, no drift). Chroma matches within the rounding of the colour conversion.
+Status: draft 8 (2026-11-23). Draft 8 covers the bottom macroblock row when the picture height is not a multiple of 32 (§4.2 SKIP, §4.7 hidden quadrants, §4.10 pass 3), checked on a 3840×2160 file (450 frames) and a 1280×720 file (3269 frames): with it the last rows match RAD on every frame of both, and the other test files decode bit-identically to draft 7. Draft 7 fixes two edge cases that only show when the picture size is not a multiple of 32 (§3.2 edge flag counts, §4.7 motion compensation at the picture edge), checked on a third `KB2n` file (720×1280, 651 frames, one keyframe): every frame matches RAD. Draft 6 was checked against two real `KB2n` files (115 and 402 frames, 2560×1440): every slice parses to its exact end, and with the loop filter of §4.10 and the corrections marked "draft 6" the decoded luma matches RAD's own output on every frame of both files (no pixel off by more than the rounding of RAD's RGB export, no drift). Chroma matches within the rounding of the colour conversion.
 
 This document describes the Bink 2 container (`KB2*`) and video bitstream in enough detail to write a decoder. Numeric constants are in [TABLES.md](TABLES.md).
 
@@ -16,6 +16,8 @@ To keep the decoder implementation independent of the LGPL source:
 This is a process recommendation, not legal advice.
 
 Draft 6 adds behaviour the reference does not have: the loop filter (§4.10), the meaning of several `frame_flags` bits, the edge flag list layout (§3.3) and three corrections (inter DC range, two motion compensation details). These were established for interoperability by analysing the behaviour of RAD's own player (`binkplay.exe` from RAD Video Tools) and checked frame by frame against RAD's output. They are restated here as rules in prose and pseudocode; no code from RAD's player is reproduced.
+
+Draft 8's rules for the bottom macroblock row were found by comparing decoder output with RAD's frames on the two files above, starting from the behaviour described in prose in the public descriptions of librempeg pull requests #217 and #218 (no code from those changes was read). The pass 3 rule of §4.10 was found by experiment only.
 
 Where this document says "the reference" it means that FFmpeg decoder. It was never merged, its authors called it imperfect, and it has not been compared with RAD's decoder. Behaviour copied from it may contain its bugs. Those cases are marked **(unverified)**, and [Open questions](#open-questions) collects them.
 
@@ -229,7 +231,7 @@ The four MB types are decoded as follows:
 
 **SKIP:**
 1. `intra_q = pred_q(intra)`, `inter_q = pred_q(inter)`.
-2. Copy the co-located 32×32 luma (and alpha) area and the 16×16 area of each chroma plane from the reference frame.
+2. Copy the co-located 32×32 luma (and alpha) area and the 16×16 area of each chroma plane from the reference frame. Exception *(draft 8)*: a **hidden quadrant** (§4.7) is not copied from its own position but motion-compensated with the vector (0, 0) adjusted as in §4.7, i.e. it is copied from the last 16 luma rows (8 chroma rows) above `H16`.
 3. No bits are read. Motion vectors stay 0.
 
 **MOTION:**
@@ -386,6 +388,14 @@ The same vector values serve both:
 
 Every block is predicted normally, wherever its vector points *(draft 7)*. The reference frame is the whole **coded** frame (32-aligned, including the decoded pixels right of and below the visible picture), and any sample outside it takes the value of the nearest coded sample (edge replication). There is no "out of picture" case. (The reference skips blocks whose source top-left is outside the *visible* picture, including zero-vector blocks in the padding. RAD doesn't: on a 720×1280 file that difference drifts the right edge within 13 frames, while predicting normally matches RAD on all 651 frames.)
 
+**Hidden quadrants** *(draft 8)*. Let `H16 = ceil_to(height, 16)`. When the height is not a multiple of 32, the bottom MB row reaches 16 rows past `H16`, and its two bottom quadrants (j = 2, 3) lie entirely at or below `H16`. Call a quadrant **hidden** if its luma top `Y ≥ H16`. For a hidden quadrant, the vertical vector component is adjusted before motion compensation:
+```
+iy  = vy >> 1;  fy = vy & 1
+lim = H16 - 16 - 3·fy - Y          // keeps the source block (plus the 3 rows the half-pel filter reads below it) above H16
+if iy > lim:  vy = 2·lim + fy      // the fraction is kept
+```
+The adjusted `vy` is used for the luma block and for the co-located chroma blocks (whose fraction and offset come from it as above), and for alpha **(unverified: no test file with alpha)**. `vx` is never adjusted, and quadrants that are not hidden are never adjusted. The adjustment only affects the prediction: motion vector prediction (§4.6) and the loop filter (§4.10) use the vectors as decoded. SKIP MBs treat their hidden quadrants the same way, with vector (0, 0) (§4.2). Hidden pixels are never shown, but they reach the picture through DC prediction, neighbour refresh and DC smoothing of the last visible block row. (Without the three draft 8 rules, a 3840×2160 file goes wrong in its last 4 rows from the first frame with horizontal edge filtering on, and stays wrong; without only the SKIP rule, 9 of its 450 frames still differ.)
+
 **Luma filter.** For six samples `s[-2] … s[3]` around the half-pel position between `s[0]` and `s[1]`:
 `h = clip8(( ((19·(s0 + s1)) >> 1) − 2·(s−1 + s2) + ((s−2 + s3) >> 1) + 8 ) >> 4)`
 
@@ -520,7 +530,7 @@ if sB >= 2: q1' = clip8(q1 - b)
 
 **Pass 2: vertical edges** (skipped if `frame_flags` bit 14 is set). For every block row and every block column bx ≥ 1, filter the edge between blocks bx−1 (A) and bx (B) on all 8 pixel rows of the block, unless the column flag says off: the edge at plane x = 8·bx uses `C[bx − 1]` in luma (and alpha) and `C[2·bx − 1]` in chroma (the flag of the co-located luma edge). A flag value of 1 switches the edge off.
 
-**Pass 3: horizontal edges** (skipped if `frame_flags` bit 15 is set). Same, for every block row by ≥ 1 between blocks above (A) and below (B), on all 8 pixel columns, using `R[by − 1]` in luma and `R[2·by − 1]` in chroma.
+**Pass 3: horizontal edges** (skipped if `frame_flags` bit 15 is set). Same, for every block row by ≥ 1 between blocks above (A) and below (B), on all 8 pixel columns, using `R[by − 1]` in luma and `R[2·by − 1]` in chroma. Edges at or below `H16` (§4.7) are **never** filtered *(draft 8)*: in luma the edges with `8·by ≥ H16`, in chroma those with `8·by ≥ H16 / 2`. These are exactly the edges whose index would be past the end of the row flag list (§3.2 counts it from `H16`). Filtering them, as a flag of 0 would, changes the last 2 visible rows. (When a frame has no lists, bit 16 clear, the same rule is assumed **(unverified: does not occur in the test files)**.)
 
 Each edge reads the pixels as left by the edges filtered before it in the same pass order (block rows top to bottom, columns left to right). Edges of the same pass never share pixels, so this order only matters between the passes.
 
@@ -688,5 +698,6 @@ Things the reference does not settle, to resolve by testing against real files a
 7. **Unknown header fields:** 0x10, the extra field in `i`/`j`/`k`, the other video flags, and the `frame_flags` bits not listed in §3.2 (in particular 17, 19 and 24–31, which RAD's player reads but which have no visible effect on the test files).
 8. **Colour conversion: answered for RAD's converter.** RAD Video Tools converts with the BT.601 matrix at **full** range, centred bilinear chroma upsampling and chroma centred on 128.5 (black-box fit, see INFERRED.md on the implementation branch). Using BT.601 limited range instead costs about 7 dB and makes warm content look too saturated.
 11. **P-frame drift: closed (draft 6).** It came from the missing loop filter (§4.10), the edge flag layout (§3.3), the inter DC range (§4.3) and the two motion compensation details (§4.7). With all of them, both test files match RAD on every frame.
+12. **Bottom macroblock row: closed (draft 8)** for the integer variant: §4.2 SKIP, §4.7 hidden quadrants, §4.10 pass 3. Not checked: the float variant and alpha (no test files). The librempeg descriptions (#218) also report behaviour for older streams without `frame_flags` bit 18 (0x40000: a residual filter inside RESIDUE MBs) and for half-pel vectors at the very end of the reference in `KB2g`. That is not covered here (no test file).
 9. **Float bit-exactness.** It depends on IEEE float32 evaluation (no fused multiply-add, no extended precision).
 10. **Bink Audio: see [AUDIO.md](AUDIO.md)** (draft 1, DCT codec checked against RAD).
