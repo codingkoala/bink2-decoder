@@ -21,7 +21,8 @@ pub(crate) type Mv = [i32; 2];
 /// What to do when a motion vector points outside the picture (SPEC §4.7, open question 2).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum OutOfRangeMv {
-    /// Predict normally from the coded (32-aligned) reference frame with edge replication, as RAD does (SPEC §4.7 draft 7).
+    /// Predict normally from the coded (32-aligned) reference frame with edge replication, as RAD does (SPEC §4.7 draft 7;
+    /// unchanged in draft 8, which only adjusts the vectors of hidden quadrants beforehand).
     #[default]
     Predict,
     /// Alternative to RAD's behaviour, kept for experiments: leave the destination block as a
@@ -362,6 +363,11 @@ pub(crate) struct FrameCtx<'a> {
     pub has_alpha: bool,
     pub pic_w: i64,
     pub pic_h: i64,
+    /// `H16 = ceil_to(height, 16)` for the hidden quadrant rules of SPEC §4.7 / §4.2 (draft 8).
+    /// `None` for the float variant (revisions <= f, SPEC §5): draft 8 was only checked on
+    /// integer-variant files, so the float variant keeps the plain co-located copy and the
+    /// decoded vectors.
+    pub hidden_h16: Option<i64>,
     pub mb_w: usize,
     pub opts: DecoderOptions,
     /// Set by the slice decoders to the MB that failed.
@@ -373,7 +379,10 @@ pub(crate) struct FrameCtx<'a> {
 }
 
 impl FrameCtx<'_> {
-    /// SKIP: copies the co-located MB from the reference for all planes.
+    /// Copies the co-located MB from the reference for all planes: SKIP in the float variant
+    /// (unchanged by SPEC draft 8, which was checked on the integer variant only; see
+    /// [`FrameCtx::hidden_h16`]) and slice error concealment. The integer variant's SKIP uses
+    /// [`FrameCtx::skip_mb`].
     pub fn copy_mb(&mut self, mbx: usize, mby: usize) -> Result<()> {
         let r = self.refr.ok_or(Error::MissingReference)?;
         for (p, (dst, src)) in self.cur.planes.iter_mut().zip(r.planes.iter()).enumerate() {
@@ -383,7 +392,9 @@ impl FrameCtx<'_> {
         Ok(())
     }
 
-    /// Copies one plane's co-located MB from the reference.
+    /// Copies one plane's co-located MB from the reference. Only used for float-variant alpha
+    /// (SPEC §5.1 stand-in), so it does not apply the draft 8 hidden quadrant rule; the integer
+    /// variant motion-compensates alpha through [`FrameCtx::mc_mb`] / [`FrameCtx::skip_mb`].
     pub fn copy_mb_plane(&mut self, p: usize, mbx: usize, mby: usize) -> Result<()> {
         let r = self.refr.ok_or(Error::MissingReference)?;
         let n = if is_chroma(p) { 16 } else { 32 };
@@ -393,44 +404,99 @@ impl FrameCtx<'_> {
         Ok(())
     }
 
+    /// SKIP for the integer variant (SPEC §4.2 step 2, draft 8): copies the co-located MB from
+    /// the reference, except that hidden quadrants (§4.7) are motion-compensated with the vector
+    /// (0, 0) adjusted as in §4.7, i.e. copied from the last 16 luma (8 chroma) rows above H16.
+    /// This covers every plane, alpha included (§4.7 says alpha too, unverified).
+    pub fn skip_mb(&mut self, mbx: usize, mby: usize) -> Result<()> {
+        self.copy_mb(mbx, mby)?;
+        let Some(h16) = self.hidden_h16 else { return Ok(()) };
+        let planes: &[usize] = if self.has_alpha { &[0, 1, 2, 3] } else { &[0, 1, 2] };
+        for j in 0..4 {
+            if quadrant_y(mby, j) >= h16 {
+                self.mc_quadrant(mbx, mby, j, [0, 0], planes)?;
+            }
+        }
+        Ok(())
+    }
+
     /// Motion-compensates the planes listed in `planes` of MB (mbx, mby) (SPEC §4.7).
+    /// `mv` are the decoded vectors; hidden quadrants get their vertical component adjusted
+    /// here for the prediction only (draft 8), the caller keeps the decoded vectors for vector
+    /// prediction and the loop filter.
     pub fn mc_mb(&mut self, mbx: usize, mby: usize, mv: &[Mv; 4], planes: &[usize]) -> Result<()> {
+        self.refr.ok_or(Error::MissingReference)?;
+        for (j, &v) in mv.iter().enumerate() {
+            self.mc_quadrant(mbx, mby, j, v, planes)?;
+        }
+        Ok(())
+    }
+
+    /// Motion-compensates quadrant j (16×16 luma, 8×8 chroma) of the listed planes with the
+    /// decoded vector `v`, adjusted first if the quadrant is hidden (SPEC §4.7 draft 8).
+    fn mc_quadrant(&mut self, mbx: usize, mby: usize, j: usize, v: Mv, planes: &[usize]) -> Result<()> {
         let r = self.refr.ok_or(Error::MissingReference)?;
         let policy = self.opts.out_of_range_mv;
+        let v = match self.hidden_h16 {
+            Some(h16) => [v[0], adjust_hidden_vy(v[1], quadrant_y(mby, j), h16)],
+            None => v,
+        };
         for &p in planes {
             let (Some(dst), Some(src)) = (self.cur.planes.get_mut(p), r.planes.get(p)) else {
                 continue;
             };
             let chroma = is_chroma(p);
-            for (j, v) in mv.iter().enumerate() {
-                let (bs, x, y) = if chroma {
-                    (8, 16 * mbx + 8 * (j & 1), 16 * mby + 8 * (j >> 1))
-                } else {
-                    (16, 32 * mbx + 16 * (j & 1), 32 * mby + 16 * (j >> 1))
-                };
-                let (w, h, sx, sy, fx, fy) = if chroma {
-                    (
-                        self.pic_w / 2,
-                        self.pic_h / 2,
-                        x as i64 + (v[0] >> 2) as i64,
-                        y as i64 + (v[1] >> 2) as i64,
-                        v[0] & 3,
-                        v[1] & 3,
-                    )
-                } else {
-                    (
-                        self.pic_w,
-                        self.pic_h,
-                        x as i64 + (v[0] >> 1) as i64,
-                        y as i64 + (v[1] >> 1) as i64,
-                        v[0] & 1,
-                        v[1] & 1,
-                    )
-                };
-                mc_block(dst, src, x, y, bs, sx, sy, fx, fy, w, h, chroma, policy);
-            }
+            let (bs, x, y) = if chroma {
+                (8, 16 * mbx + 8 * (j & 1), 16 * mby + 8 * (j >> 1))
+            } else {
+                (16, 32 * mbx + 16 * (j & 1), 32 * mby + 16 * (j >> 1))
+            };
+            let (w, h, sx, sy, fx, fy) = if chroma {
+                (
+                    self.pic_w / 2,
+                    self.pic_h / 2,
+                    x as i64 + (v[0] >> 2) as i64,
+                    y as i64 + (v[1] >> 2) as i64,
+                    v[0] & 3,
+                    v[1] & 3,
+                )
+            } else {
+                (
+                    self.pic_w,
+                    self.pic_h,
+                    x as i64 + (v[0] >> 1) as i64,
+                    y as i64 + (v[1] >> 1) as i64,
+                    v[0] & 1,
+                    v[1] & 1,
+                )
+            };
+            mc_block(dst, src, x, y, bs, sx, sy, fx, fy, w, h, chroma, policy);
         }
         Ok(())
+    }
+}
+
+/// Luma top row of quadrant j of MB row `mby`.
+#[inline]
+fn quadrant_y(mby: usize, j: usize) -> i64 {
+    (32 * mby + 16 * (j >> 1)) as i64
+}
+
+/// SPEC §4.7 draft 8, hidden quadrants: the vertical vector (luma half-pel units) of the
+/// quadrant whose luma top row is `y`, as used for motion compensation. Quadrants with
+/// `y < h16` are never adjusted; for hidden ones the integer part is limited so that the source
+/// block, plus the 3 rows the half-pel filter reads below it, stays above H16. The fraction is
+/// kept.
+pub(crate) fn adjust_hidden_vy(vy: i32, y: i64, h16: i64) -> i32 {
+    if y < h16 {
+        return vy;
+    }
+    let (iy, fy) = (vy >> 1, vy & 1);
+    let lim = h16 - 16 - 3 * fy as i64 - y;
+    if iy as i64 > lim {
+        (2 * lim) as i32 + fy
+    } else {
+        vy
     }
 }
 
@@ -472,7 +538,8 @@ fn mc_block(
     chroma: bool,
     policy: OutOfRangeMv,
 ) {
-    // SPEC §4.7 draft 7: RAD predicts every block from the coded frame; the visible-size check only applies to the experimental policies.
+    // SPEC §4.7 draft 7 (still so in draft 8): RAD predicts every block from the coded frame; the visible-size check only
+    // applies to the experimental policies. The draft 8 hidden quadrant adjustment is applied by the caller.
     let outside = policy != OutOfRangeMv::Predict && (sx < 0 || sx >= w || sy < 0 || sy >= h);
     if outside {
         match policy {
@@ -651,8 +718,9 @@ impl Decoder {
         let (mut row_flags, mut col_flags) = (None, None);
         if frame_flags & 0x10000 != 0 {
             // Edge flags (SPEC §3.2 step 5, §3.3); used by the loop filter (§4.10).
-            // SPEC §3.2 draft 7: the row count uses the 16-aligned height, the column count the
-            // 32-aligned width
+            // SPEC §3.2 draft 7 (unchanged in draft 8): the row count uses the 16-aligned height,
+            // the column count the 32-aligned width. Row edges past the list end lie at or below
+            // H16 and are never filtered (§4.10 pass 3, draft 8; see `filter_frame`).
             if frame_flags & 0x8000 == 0 {
                 row_flags = Some(read_edge_flags(br, ceil_to(self.height as u32, 16) as usize / 8 - 1)?);
             }
@@ -703,6 +771,7 @@ impl Decoder {
                 has_alpha: self.has_alpha,
                 pic_w: self.width as i64,
                 pic_h: self.height as i64,
+                hidden_h16: (!is_float_revision(self.revision)).then(|| ceil_to(self.height as u32, 16) as i64),
                 mb_w: self.aligned_w / 32,
                 opts: self.opts,
                 fail_mb: None,
@@ -751,6 +820,7 @@ impl Decoder {
             filter_frame(
                 &mut cur,
                 &self.blocks,
+                self.height,
                 hdr.frame_flags,
                 hdr.row_flags.as_deref(),
                 hdr.col_flags.as_deref(),
@@ -885,5 +955,79 @@ mod tests {
         let mut out = [0f32; 16];
         predict_dc(4, &r, &DcNeighbours::none(), true, 0.0, 2047.0, &mut out);
         assert_eq!(&out[..4], &[1024.5, 1025.0, 1025.0, 1025.5]);
+    }
+    #[test]
+    fn hidden_quadrant_vector_adjustment() {
+        // height 2160 -> H16 = 2160; the bottom MB row starts at 2144, its quadrants j = 2, 3
+        // at Y = 2160 are hidden.
+        let h16 = ceil_to(2160, 16) as i64;
+        assert_eq!(h16, 2160);
+        assert_eq!(adjust_hidden_vy(0, 2160, h16), 2 * (2160 - 16 - 2160));
+        assert_eq!(adjust_hidden_vy(0, 2160, h16), -32);
+        // half-pel: lim = 2160 - 16 - 3 - 2160 = -19 -> vy = 2·(-19) + 1
+        assert_eq!(adjust_hidden_vy(1, 2160, h16), -37);
+        // already far enough up: unchanged
+        assert_eq!(adjust_hidden_vy(-40, 2160, h16), -40);
+        assert_eq!(adjust_hidden_vy(-39, 2160, h16), -39);
+        // quadrants above H16 (the top row of the bottom MB) are never adjusted
+        assert_eq!(adjust_hidden_vy(0, 2144, h16), 0);
+        assert_eq!(adjust_hidden_vy(57, 2144, h16), 57);
+        // a height that is a multiple of 32: no quadrant of the coded frame reaches H16
+        for height in [64u32, 1088, 2176] {
+            let h16 = ceil_to(height, 16) as i64;
+            for y in (0..ceil_to(height, 32) as i64).step_by(16) {
+                for vy in -70..70 {
+                    assert_eq!(adjust_hidden_vy(vy, y, h16), vy);
+                }
+            }
+        }
+    }
+    #[test]
+    fn skip_hidden_quadrants_copy_from_above_h16() {
+        // Coded 32×64 (two MB rows), visible height 40 -> H16 = 48: quadrants at Y = 48 are hidden.
+        let mut refr = FrameBuf::new(32, 64, false);
+        for plane in refr.planes.iter_mut() {
+            for y in 0..plane.h {
+                for x in 0..plane.w {
+                    let i = plane.idx(x as i64, y as i64);
+                    plane.data[i] = y as u8;
+                }
+            }
+        }
+        refr.extend_edges();
+        let run = |hidden_h16: Option<i64>| {
+            let mut cur = FrameBuf::new(32, 64, false);
+            let mut mb_info = vec![MbInfo::default(); 2];
+            let mut blocks = Vec::new();
+            let mut ctx = FrameCtx {
+                cur: &mut cur,
+                refr: Some(&refr),
+                keyframe: false,
+                frame_flags: 0,
+                has_alpha: false,
+                pic_w: 32,
+                pic_h: 40,
+                hidden_h16,
+                mb_w: 1,
+                opts: DecoderOptions::default(),
+                fail_mb: None,
+                mb_info: &mut mb_info,
+                blocks: &mut blocks,
+            };
+            ctx.skip_mb(0, 1).unwrap();
+            let col = |p: &Plane| (0..p.h).map(|y| p.data[p.idx(3, y as i64)]).collect::<Vec<u8>>();
+            (col(&cur.planes[0]), col(&cur.planes[1]))
+        };
+        let (y, c) = run(Some(48));
+        // luma: rows 32..48 co-located, hidden rows 48..64 from 32..48 (H16 - 16)
+        assert_eq!(y[32..48], (32..48).collect::<Vec<u8>>()[..]);
+        assert_eq!(y[48..64], (32..48).collect::<Vec<u8>>()[..]);
+        // chroma: rows 16..24 co-located, hidden rows 24..32 from 16..24
+        assert_eq!(c[16..24], (16..24).collect::<Vec<u8>>()[..]);
+        assert_eq!(c[24..32], (16..24).collect::<Vec<u8>>()[..]);
+        // float variant (no H16): plain co-located copy
+        let (y, c) = run(None);
+        assert_eq!(y[32..64], (32..64).collect::<Vec<u8>>()[..]);
+        assert_eq!(c[16..32], (16..32).collect::<Vec<u8>>()[..]);
     }
 }

@@ -402,7 +402,8 @@ fn decode_mb(
         SKIP => {
             me.intra_q = pq_intra;
             me.inter_q = pq_inter;
-            ctx.copy_mb(mbx, mby)?;
+            // SPEC §4.2 draft 8: hidden quadrants are predicted from above H16, not copied.
+            ctx.skip_mb(mbx, mby)?;
             for p in 0..nplanes {
                 record_blocks(ctx, p, mbx, mby, |_, _| BlockInfo::default());
             }

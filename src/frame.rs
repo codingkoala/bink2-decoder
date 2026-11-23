@@ -1,7 +1,7 @@
 //! Frame buffers with an edge-replicated margin, and the public output frame.
 
 /// Margin around every reference plane, in pixels.
-// SPEC §4.7 draft 7: samples outside the coded (32-aligned) frame replicate its edge pixels.
+// SPEC §4.7 draft 7 (unchanged in draft 8): samples outside the coded (32-aligned) frame replicate its edge pixels.
 pub const MARGIN: usize = 32;
 
 /// One 8-bit plane covering the coded (aligned) area plus `MARGIN` on every side.
