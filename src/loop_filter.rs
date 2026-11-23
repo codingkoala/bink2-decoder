@@ -2,8 +2,10 @@
 //! and horizontal 8×8 block edges.
 
 use crate::dsp::clip8;
-use crate::frame::{FrameBuf, Plane};
+use crate::frame::{FrameBuf, PlaneBand};
+use crate::par::{par_map, split_ends};
 use crate::video::Mv;
+use std::ops::Range;
 
 /// What the filter needs to know about one 8×8 block of one plane.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -68,15 +70,55 @@ impl PlaneBlocks {
         self.info.fill(BlockInfo::default());
     }
 
+    /// Splits the block rows into disjoint mutable bands `[0, ends[0])`, `[ends[0], ends[1])`,
+    /// … (`ends` increasing, at most `bh`), one per slice.
+    pub fn bands(&mut self, ends: &[usize]) -> Vec<BlocksBand<'_>> {
+        let bw = self.bw;
+        let mut rest = &mut self.info[..];
+        let mut by0 = 0;
+        let mut out = Vec::with_capacity(ends.len());
+        for &by1 in ends {
+            assert!(by0 <= by1 && by1 <= self.bh, "bad band end {by1}");
+            let (band, tail) = std::mem::take(&mut rest).split_at_mut((by1 - by0) * bw);
+            out.push(BlocksBand { bw, by0, info: band });
+            rest = tail;
+            by0 = by1;
+        }
+        out
+    }
+
     #[inline]
     pub fn get(&self, bx: usize, by: usize) -> &BlockInfo {
         &self.info[by * self.bw + bx]
     }
 
+    #[cfg(test)]
     #[inline]
     pub fn set(&mut self, bx: usize, by: usize, b: BlockInfo) {
         if bx < self.bw && by < self.bh {
             self.info[by * self.bw + bx] = b;
+        }
+    }
+}
+
+/// Mutable view of the block rows `[by0, by0 + info.len() / bw)` of a [`PlaneBlocks`].
+#[derive(Debug)]
+pub(crate) struct BlocksBand<'a> {
+    pub bw: usize,
+    /// First block row of the band.
+    pub by0: usize,
+    pub info: &'a mut [BlockInfo],
+}
+
+impl BlocksBand<'_> {
+    /// Sets the info of block (bx, by) (plane block coordinates). Blocks outside the band are
+    /// ignored, as [`PlaneBlocks::set`] ignores blocks outside the plane.
+    #[inline]
+    pub fn set(&mut self, bx: usize, by: usize, b: BlockInfo) {
+        if bx < self.bw && by >= self.by0 {
+            if let Some(slot) = self.info.get_mut((by - self.by0) * self.bw + bx) {
+                *slot = b;
+            }
         }
     }
 }
@@ -144,10 +186,12 @@ pub(crate) fn smooth_surface(g: &[[i32; 3]; 3]) -> [[u8; 8]; 8] {
     out
 }
 
-/// Pass 1: replaces every intra block with `s = 3` by its smooth surface.
-pub(crate) fn smooth_plane(p: &mut Plane, blocks: &PlaneBlocks, thr: i32) {
-    for by in 0..blocks.bh.min(p.h / 8) {
-        for bx in 0..blocks.bw.min(p.w / 8) {
+/// Pass 1 on the block rows `rows`: replaces every intra block with `s = 3` by its smooth
+/// surface. `p` must hold those rows. The surface depends on the block info only, never on
+/// pixels, so any split of the rows gives the same result.
+pub(crate) fn smooth_rows(p: &mut PlaneBand, blocks: &PlaneBlocks, thr: i32, rows: Range<usize>) {
+    for by in rows {
+        for bx in 0..blocks.bw {
             let b = blocks.get(bx, by);
             if !(b.intra && b.s == 3) {
                 continue;
@@ -198,11 +242,12 @@ pub(crate) fn filter_edge(px: [u8; 4], sa: u8, sb: u8) -> [u8; 4] {
     out
 }
 
-/// Pass 2: vertical edges. `off(bx)` is true if the edge at plane x = 8·bx is switched off.
-pub(crate) fn vertical_pass(p: &mut Plane, blocks: &PlaneBlocks, off: &dyn Fn(usize) -> bool) {
-    let (bw, bh) = (blocks.bw.min(p.w / 8), blocks.bh.min(p.h / 8));
-    for by in 0..bh {
-        for bx in 1..bw {
+/// Pass 2 on the block rows `rows`: vertical edges. `off(bx)` is true if the edge at plane
+/// x = 8·bx is switched off. `p` must hold those rows. The edges of one block row only touch
+/// that block row's pixels.
+pub(crate) fn vertical_rows(p: &mut PlaneBand, blocks: &PlaneBlocks, off: &dyn Fn(usize) -> bool, rows: Range<usize>) {
+    for by in rows {
+        for bx in 1..blocks.bw {
             if off(bx) {
                 continue;
             }
@@ -218,15 +263,21 @@ pub(crate) fn vertical_pass(p: &mut Plane, blocks: &PlaneBlocks, off: &dyn Fn(us
     }
 }
 
-/// Pass 3: horizontal edges. `off(by)` is true if the edge at plane y = 8·by is switched off.
-pub(crate) fn horizontal_pass(p: &mut Plane, blocks: &PlaneBlocks, off: &dyn Fn(usize) -> bool) {
-    let (bw, bh) = (blocks.bw.min(p.w / 8), blocks.bh.min(p.h / 8));
+/// Pass 3 on the horizontal edges at plane y = 8·by for `by` in `edges` (by >= 1). `off(by)` is
+/// true if the edge is switched off. The edge at 8·by touches pixel rows 8·by − 2 … 8·by + 1,
+/// which `p` must hold; edges never share rows, so they can be filtered in any order.
+pub(crate) fn horizontal_rows(
+    p: &mut PlaneBand,
+    blocks: &PlaneBlocks,
+    off: &dyn Fn(usize) -> bool,
+    edges: Range<usize>,
+) {
     let s = p.stride;
-    for by in 1..bh {
+    for by in edges {
         if off(by) {
             continue;
         }
-        for bx in 0..bw {
+        for bx in 0..blocks.bw {
             let Some((sa, sb)) = edge_strength(blocks.get(bx, by - 1), blocks.get(bx, by)) else {
                 continue;
             };
@@ -244,6 +295,12 @@ pub(crate) fn horizontal_pass(p: &mut Plane, blocks: &PlaneBlocks, off: &dyn Fn(
 
 /// Runs the whole filter on a decoded frame (planes in coding order Y, C1, C2, A). `height` is
 /// the visible picture height.
+///
+/// With `threads` > 1 each plane is cut into bands of block rows that are filtered in parallel,
+/// in two rounds: passes 1 and 2 (which only touch the pixels of their own block row), then
+/// pass 3 on bands cut half way through a block row (4 pixel rows above each band's first
+/// edge), so that every horizontal edge lies inside one band. The result is the same as running
+/// the passes in order over each whole plane.
 pub(crate) fn filter_frame(
     f: &mut FrameBuf,
     blocks: &[PlaneBlocks],
@@ -251,6 +308,7 @@ pub(crate) fn filter_frame(
     frame_flags: u32,
     row_flags: Option<&[bool]>,
     col_flags: Option<&[bool]>,
+    threads: usize,
 ) {
     let thr = ((frame_flags & 0xFF) * 8) as i32;
     // A flag that is not coded is 0 (SPEC §3.2): the edge is filtered.
@@ -261,33 +319,71 @@ pub(crate) fn filter_frame(
     // sized from the 32-aligned width and covers every vertical edge.
     let h16 = height.div_ceil(16) * 16;
     let flag = |l: Option<&[bool]>, i: usize| l.and_then(|l| l.get(i)).copied().unwrap_or(false);
+    let col_off = |chroma: bool, bx: usize| flag(col_flags, if chroma { 2 * bx - 1 } else { bx - 1 });
+    let row_off = |chroma: bool, by: usize| {
+        let limit = if chroma { h16 / 2 } else { h16 };
+        8 * by >= limit || flag(row_flags, if chroma { 2 * by - 1 } else { by - 1 })
+    };
+    // Alpha (plane 3): DC smoothing only, not with frame_flags bit 19.
+    // SPEC-QUESTION: §4.10 also names alpha in the edge flag indexing of pass 2; we follow the
+    // statement that alpha gets DC smoothing only (unverified, no test file).
+    let smooth = |pi: usize| pi != 3 || frame_flags & 0x80000 == 0;
+    let vertical = |pi: usize| pi != 3 && frame_flags & 0x4000 == 0;
+    let horizontal = |pi: usize| pi != 3 && frame_flags & 0x8000 == 0;
+    let parts = threads.max(1);
+
+    // Round 1: passes 1 and 2, on bands of whole block rows.
+    let mut tasks = Vec::new();
     for (pi, (plane, pb)) in f.planes.iter_mut().zip(blocks).enumerate() {
-        if pi == 3 {
-            // Alpha: DC smoothing only, not with frame_flags bit 19.
-            // SPEC-QUESTION: §4.10 also names alpha in the edge flag indexing of pass 2; we
-            // follow the statement that alpha gets DC smoothing only (unverified, no test file).
-            if frame_flags & 0x80000 == 0 {
-                smooth_plane(plane, pb, thr);
-            }
+        let bh = pb.bh.min(plane.h / 8);
+        if !smooth(pi) && !vertical(pi) {
             continue;
         }
-        let chroma = pi != 0;
-        smooth_plane(plane, pb, thr);
-        if frame_flags & 0x4000 == 0 {
-            let off = |bx: usize| flag(col_flags, if chroma { 2 * bx - 1 } else { bx - 1 });
-            vertical_pass(plane, pb, &off);
-        }
-        if frame_flags & 0x8000 == 0 {
-            let limit = if chroma { h16 / 2 } else { h16 };
-            let off = |by: usize| 8 * by >= limit || flag(row_flags, if chroma { 2 * by - 1 } else { by - 1 });
-            horizontal_pass(plane, pb, &off);
+        let ends = split_ends(0, bh, parts);
+        let rows: Vec<usize> = ends.iter().map(|e| 8 * e).collect();
+        let mut by0 = 0;
+        for (band, &by1) in plane.bands(&rows).into_iter().zip(&ends) {
+            tasks.push((pi, pb, band, by0..by1));
+            by0 = by1;
         }
     }
+    par_map(tasks, threads, |(pi, pb, mut band, rows)| {
+        if smooth(pi) {
+            smooth_rows(&mut band, pb, thr, rows.clone());
+        }
+        if vertical(pi) {
+            vertical_rows(&mut band, pb, &|bx| col_off(pi != 0, bx), rows);
+        }
+    });
+
+    // Round 2: pass 3. A band filters the edges `[k0, k1)` and holds the pixel rows
+    // `[8·k0 − 4, 8·k1 − 4)` (the first band from row 0, the last to the plane's end).
+    let mut tasks = Vec::new();
+    for (pi, (plane, pb)) in f.planes.iter_mut().zip(blocks).enumerate() {
+        let bh = pb.bh.min(plane.h / 8);
+        if !horizontal(pi) || bh < 2 {
+            continue;
+        }
+        let ends = split_ends(1, bh, parts);
+        let last = ends.len() - 1;
+        let rows: Vec<usize> = (ends.iter().enumerate())
+            .map(|(j, &e)| if j == last { plane.h } else { 8 * e - 4 })
+            .collect();
+        let mut k0 = 1;
+        for (band, &k1) in plane.bands(&rows).into_iter().zip(&ends) {
+            tasks.push((pi, pb, band, k0..k1));
+            k0 = k1;
+        }
+    }
+    par_map(tasks, threads, |(pi, pb, mut band, edges)| {
+        horizontal_rows(&mut band, pb, &|by| row_off(pi != 0, by), edges);
+    });
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::frame::Plane;
 
     fn intra(s: u8, dc: i32) -> BlockInfo {
         BlockInfo {
@@ -408,7 +504,7 @@ mod tests {
         let mut p = Plane::new(24, 24, 7);
         let mut b = grid([800, 800, 800, 800, 1600, 800, 800, 800, 800], &[(0, intra(1, 800))]);
         b.info[8] = inter([0, 0]);
-        smooth_plane(&mut p, &b, 0);
+        smooth_rows(&mut p.band(), &b, 0, 0..b.bh);
         assert_eq!(p.data[p.idx(0, 0)], 7, "s = 1 block untouched");
         assert_eq!(p.data[p.idx(16, 16)], 7, "inter block untouched");
         assert_eq!(p.data[p.idx(8, 8)], 200, "thr 0: flat at own DC");
@@ -463,15 +559,15 @@ mod tests {
             }
         }
         let base = p.clone();
-        vertical_pass(&mut p, &b, &|_| true);
+        vertical_rows(&mut p.band(), &b, &|_| true, 0..b.bh);
         assert_eq!(p.data, base.data, "flag 1 switches the edge off");
-        vertical_pass(&mut p, &b, &|_| false);
+        vertical_rows(&mut p.band(), &b, &|_| false, 0..b.bh);
         // sA = 1: p0 += 20; sB = 2: q0 -= 20, q1 -= 10
         let row: Vec<u8> = (5..11).map(|x| p.data[p.idx(x, 3)]).collect();
         assert_eq!(row, [0, 0, 20, 60, 70, 80]);
         // horizontal: (left, top) s = 1 vs (left, bottom) s = 1 -> filtered, but no step
         let before = p.clone();
-        horizontal_pass(&mut p, &b, &|_| false);
+        horizontal_rows(&mut p.band(), &b, &|_| false, 1..b.bh);
         assert_eq!(p.data, before.data);
     }
 
@@ -490,15 +586,15 @@ mod tests {
         blocks[0].set(1, 0, intra(1, 0));
         let orig = f.clone();
         // bit 14: no vertical edges
-        filter_frame(&mut f, &blocks, 32, 0x4000, None, None);
+        filter_frame(&mut f, &blocks, 32, 0x4000, None, None, 1);
         assert_eq!(f.planes[0].data, orig.planes[0].data);
         // lists in use but not coded (bit 16 clear): all flags 0 -> filtered
-        filter_frame(&mut f, &blocks, 32, 0, None, None);
+        filter_frame(&mut f, &blocks, 32, 0, None, None, 1);
         assert_eq!(f.planes[0].data[f.planes[0].idx(7, 0)], 25);
         assert_eq!(f.planes[0].data[f.planes[0].idx(8, 0)], 75);
         // column flag C[0] = 1 switches the luma edge at x = 8 off
         let mut g = orig.clone();
-        filter_frame(&mut g, &blocks, 32, 0x18000, None, Some(&[true, false, false]));
+        filter_frame(&mut g, &blocks, 32, 0x18000, None, Some(&[true, false, false]), 1);
         assert_eq!(g.planes[0].data, orig.planes[0].data);
     }
 
@@ -510,7 +606,7 @@ mod tests {
         blocks[0].set(1, 0, intra(3, 1016));
         let run = |flags: u32| {
             let mut f = FrameBuf::new(32, 32, false);
-            filter_frame(&mut f, &blocks, 32, flags, None, None);
+            filter_frame(&mut f, &blocks, 32, flags, None, None, 1);
             (0..16)
                 .map(|x| f.planes[0].data[f.planes[0].idx(x, 0)])
                 .collect::<Vec<u8>>()
@@ -557,10 +653,10 @@ mod tests {
         // Vertical edges off (bit 14); row list present with every flag 0 (count H16/8 - 1 = 5).
         let rows = [false; 5];
         let mut a = orig.clone();
-        filter_frame(&mut a, &blocks, 40, 0x14000, Some(&rows), None);
+        filter_frame(&mut a, &blocks, 40, 0x14000, Some(&rows), None, 1);
         // Same without lists (bit 16 clear): the rule is the same.
         let mut b = orig.clone();
-        filter_frame(&mut b, &blocks, 40, 0x4000, None, None);
+        filter_frame(&mut b, &blocks, 40, 0x4000, None, None, 1);
         for g in [&a, &b] {
             let (y, oy) = (&g.planes[0], &orig.planes[0]);
             let px = |p: &Plane, row: usize| p.data[p.idx(4, row as i64)];
@@ -581,7 +677,7 @@ mod tests {
         }
         // A height that is a multiple of 32 filters every edge of the coded frame.
         let mut full = orig.clone();
-        filter_frame(&mut full, &blocks, 64, 0x4000, None, None);
+        filter_frame(&mut full, &blocks, 64, 0x4000, None, None, 1);
         let (y, oy) = (&full.planes[0], &orig.planes[0]);
         assert_ne!(y.data[y.idx(4, 56)], oy.data[oy.idx(4, 56)]);
     }

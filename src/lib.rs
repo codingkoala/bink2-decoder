@@ -30,6 +30,7 @@ mod f;
 mod frame;
 mod g;
 mod loop_filter;
+mod par;
 #[allow(missing_docs)]
 #[rustfmt::skip]
 pub mod tables;

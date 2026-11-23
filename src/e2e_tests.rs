@@ -395,3 +395,156 @@ fn slice_reports_and_concealment() {
     assert_flat(&f.y[64 * 32..], 128, "concealed slice (grey, no reference)");
     assert_eq!(dec.last_frame_flags(), 0);
 }
+
+/// A sequential (`threads: 1`) and a parallel decoder with otherwise equal options, fed the same
+/// packets, must agree on everything they return.
+struct SeqParPair {
+    seq: Decoder,
+    par: Decoder,
+}
+
+impl SeqParPair {
+    fn new(rev: u8, w: u32, h: u32, flags: u32, opts: DecoderOptions, threads: usize) -> SeqParPair {
+        let mut seq = Decoder::with_params(rev, w, h, flags).unwrap();
+        let mut par = seq.clone();
+        seq.set_options(DecoderOptions { threads: 1, ..opts });
+        par.set_options(DecoderOptions { threads, ..opts });
+        SeqParPair { seq, par }
+    }
+
+    /// Decodes one packet with both and checks that the results, slice reports and MB info are
+    /// identical. Returns the sequential result.
+    fn decode(&mut self, pkt: &[u8], keyframe: bool, what: &str) -> crate::Result<crate::VideoFrame> {
+        let a = self.seq.decode(pkt, keyframe);
+        let b = self.par.decode(pkt, keyframe);
+        assert!(a == b, "{what}: frames or errors differ");
+        assert_eq!(
+            self.seq.slice_reports(),
+            self.par.slice_reports(),
+            "{what}: slice reports"
+        );
+        assert!(self.seq.last_mb_info() == self.par.last_mb_info(), "{what}: MB info");
+        a
+    }
+}
+
+#[test]
+fn parallel_slices_match_sequential_on_random_packets() {
+    // Random packets fail somewhere in most slices; with and without concealment the parallel
+    // decode must give the same frames, errors and reports as the sequential one. The float
+    // variant with alpha is decoded sequentially either way (see `Decoder::decode`).
+    let mut seed = 123_456_789u32;
+    let mut rnd = move || {
+        seed ^= seed << 13;
+        seed ^= seed >> 17;
+        seed ^= seed << 5;
+        seed
+    };
+    for (rev, w, h, flags) in [
+        (b'f', 64u32, 128u32, 0u32),
+        (b'a', 40, 72, 0x0010_0000),
+        (b'g', 96, 160, 0x0010_0000),
+        (b'k', 70, 300, 0x0000_0003),
+        (b'n', 64, 200, 0x0010_0002),
+    ] {
+        for conceal in [false, true] {
+            for threads in [0, 3] {
+                let opts = DecoderOptions {
+                    conceal_slice_errors: conceal,
+                    ..Default::default()
+                };
+                let mut pair = SeqParPair::new(rev, w, h, flags, opts, threads);
+                let s = crate::slice_boundaries(rev, h, flags).len();
+                for it in 0..120 {
+                    let len = 4 * s + (rnd() % 400) as usize;
+                    let mut p: Vec<u8> = (0..len).map(|_| rnd() as u8).collect();
+                    let mut off = 4 * s;
+                    for i in 0..s - 1 {
+                        off = (off + (rnd() as usize % 60)).min(len);
+                        p[4 + 4 * i..8 + 4 * i].copy_from_slice(&(off as u32).to_le_bytes());
+                    }
+                    if it % 3 != 0 {
+                        p[0..4].copy_from_slice(&(rnd() & 0x4_0000).to_le_bytes());
+                    }
+                    let what = format!("rev {} conceal {conceal} threads {threads} packet {it}", rev as char);
+                    let _ = pair.decode(&p, it % 5 == 0, &what);
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn parallel_slices_match_sequential_on_flat_frames() {
+    // Valid two-slice keyframe, then the concealment case of `slice_reports_and_concealment`.
+    let mut slices = Vec::new();
+    for _ in 0..2 {
+        let mut w = BitWriter::default();
+        g_flat_intra_mb(&mut w, false);
+        g_flat_intra_mb(&mut w, false);
+        slices.push(w.finish());
+    }
+    let good = packet(0, &slices);
+    let mut w = BitWriter::default();
+    g_flat_intra_mb(&mut w, false);
+    g_flat_intra_mb(&mut w, false);
+    let bad = packet(0, &[w.finish(), vec![0xFF]]);
+    for conceal in [false, true] {
+        let opts = DecoderOptions {
+            conceal_slice_errors: conceal,
+            ..Default::default()
+        };
+        let mut pair = SeqParPair::new(b'h', 64, 64, 0, opts, 2);
+        assert!(pair.decode(&good, true, "good").is_ok());
+        assert_eq!(pair.decode(&bad, true, "bad").is_ok(), conceal);
+    }
+}
+
+/// Real files: decodes every frame of each file in `BINK2_PARALLEL_BK2` (a list of paths,
+/// separated like `PATH`) sequentially and in parallel and checks that every frame is identical.
+/// Run with `cargo test --release parallel_matches_sequential_on_files -- --ignored --nocapture`.
+#[test]
+#[ignore = "needs BINK2_PARALLEL_BK2"]
+fn parallel_matches_sequential_on_files() {
+    let Some(list) = std::env::var_os("BINK2_PARALLEL_BK2") else {
+        eprintln!("BINK2_PARALLEL_BK2 not set, skipping");
+        return;
+    };
+    for path in std::env::split_paths(&list) {
+        let data = std::fs::read(&path).unwrap();
+        let file = Container::parse(&data).unwrap();
+        let h = &file.header;
+        // Default thread count, and fewer threads than slices (a shared queue of slices).
+        for threads in [0, 3] {
+            let mut pair = SeqParPair::new(
+                h.revision,
+                h.width,
+                h.height,
+                h.video_flags,
+                DecoderOptions::default(),
+                threads,
+            );
+            let (mut t_seq, mut t_par) = (std::time::Duration::ZERO, std::time::Duration::ZERO);
+            for i in 0..file.num_frames() {
+                let pkt = file.frame(i).unwrap();
+                let t0 = std::time::Instant::now();
+                let a = pair.seq.decode(pkt.video, pkt.keyframe).unwrap();
+                let t1 = std::time::Instant::now();
+                let b = pair.par.decode(pkt.video, pkt.keyframe).unwrap();
+                t_seq += t1 - t0;
+                t_par += t1.elapsed();
+                assert!(a == b, "{}: frame {i} differs with {threads} threads", path.display());
+                assert_eq!(pair.seq.slice_reports(), pair.par.slice_reports(), "frame {i}");
+                assert!(pair.seq.last_mb_info() == pair.par.last_mb_info(), "frame {i}");
+            }
+            let n = file.num_frames().max(1) as f64;
+            println!(
+                "{}: {} frames identical (threads {threads}); {:.2} ms/frame sequential, {:.2} parallel",
+                path.display(),
+                file.num_frames(),
+                t_seq.as_secs_f64() * 1e3 / n,
+                t_par.as_secs_f64() * 1e3 / n
+            );
+        }
+    }
+}

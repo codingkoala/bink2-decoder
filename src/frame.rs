@@ -57,6 +57,36 @@ impl Plane {
         }
     }
 
+    /// Splits the coded rows into disjoint mutable bands `[0, ends[0])`, `[ends[0], ends[1])`,
+    /// … (`ends` increasing, at most `h`). The top and bottom margins are not part of any band.
+    /// Used to decode the slices of a frame, and to filter parts of a plane, in parallel.
+    pub fn bands(&mut self, ends: &[usize]) -> Vec<PlaneBand<'_>> {
+        let s = self.stride;
+        let mut rest = &mut self.data[MARGIN * s..];
+        let mut y0 = 0;
+        let mut out = Vec::with_capacity(ends.len());
+        for &y1 in ends {
+            assert!(y0 <= y1 && y1 <= self.h, "bad band end {y1}");
+            let (band, tail) = std::mem::take(&mut rest).split_at_mut((y1 - y0) * s);
+            out.push(PlaneBand {
+                stride: s,
+                y0,
+                y1,
+                data: band,
+            });
+            rest = tail;
+            y0 = y1;
+        }
+        out
+    }
+
+    /// The whole coded area as one band.
+    #[cfg(test)]
+    pub fn band(&mut self) -> PlaneBand<'_> {
+        let h = self.h;
+        self.bands(&[h]).pop().expect("one band")
+    }
+
     /// Copies the top-left `w × h` pixels into a tightly packed vector.
     pub fn crop(&self, w: usize, h: usize) -> Vec<u8> {
         let mut out = Vec::with_capacity(w * h);
@@ -65,6 +95,34 @@ impl Plane {
             out.extend_from_slice(&self.data[i..i + w.min(self.w)]);
         }
         out
+    }
+}
+
+/// Mutable view of the coded rows `[y0, y1)` of a [`Plane`], full stride (the left and right
+/// margin columns of those rows included, so offsets within a row match the plane's layout).
+/// Positions are plane coordinates; only rows inside the band may be accessed.
+#[derive(Debug)]
+pub(crate) struct PlaneBand<'a> {
+    pub stride: usize,
+    /// First coded row of the band.
+    pub y0: usize,
+    /// One past the last coded row.
+    pub y1: usize,
+    pub data: &'a mut [u8],
+}
+
+impl PlaneBand<'_> {
+    /// Index into `data` of plane position (x, y). `y` must lie in `[y0, y1)` and `x` in the
+    /// coded width or the margin.
+    #[inline]
+    pub fn idx(&self, x: i64, y: i64) -> usize {
+        debug_assert!(
+            y >= self.y0 as i64 && y < self.y1 as i64,
+            "row {y} outside band {}..{}",
+            self.y0,
+            self.y1
+        );
+        (y as usize - self.y0) * self.stride + (x + MARGIN as i64) as usize
     }
 }
 

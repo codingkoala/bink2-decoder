@@ -5,8 +5,9 @@ use crate::container::{is_float_revision, is_known_revision, Header, MAX_HEIGHT,
 use crate::dsp::{block_dc_from_pixels, ceil_to, clamp, copy_block, mc_chroma, mc_luma};
 use crate::edge_flags::read_edge_flags;
 use crate::error::{Error, Result};
-use crate::frame::{FrameBuf, Plane, VideoFrame};
-use crate::loop_filter::{filter_frame, PlaneBlocks};
+use crate::frame::{FrameBuf, Plane, PlaneBand, VideoFrame};
+use crate::loop_filter::{filter_frame, BlocksBand, PlaneBlocks};
+use crate::par::par_map;
 use crate::tables::ZORDER;
 
 /// Block (macroblock) types.
@@ -46,6 +47,22 @@ pub struct DecoderOptions {
     /// matches RAD's decoder, and P frames drift). The filter runs by default for the integer
     /// variant; the float variant never runs it (see [`Decoder`]).
     pub disable_loop_filter: bool,
+    /// Number of threads that decode the slices of a frame, and then run the loop filter, in
+    /// parallel. 0 (the default) uses [`std::thread::available_parallelism`]; 1 decodes on the
+    /// calling thread only, slice after slice. The output is the same either way. Slice
+    /// decoding uses at most one thread per slice, and float-variant files with alpha are
+    /// always decoded slice after slice (see [`Decoder::decode`]).
+    pub threads: usize,
+}
+
+impl DecoderOptions {
+    /// The thread count `threads` stands for (at least 1).
+    fn resolved_threads(&self) -> usize {
+        match self.threads {
+            0 => std::thread::available_parallelism().map_or(1, |n| n.get()),
+            n => n,
+        }
+    }
 }
 
 /// Side information about one decoded macroblock.
@@ -264,15 +281,16 @@ fn max3<T: PartialOrd + Copy>(a: T, b: T, c: T) -> T {
 }
 
 /// Recomputes the DCs of MB (mbx, mby) from the current frame's pixels for the first
-/// `nplanes` planes (SPEC §4.8 neighbour refresh).
+/// `nplanes` planes (SPEC §4.8 neighbour refresh). `f` holds the current slice's rows, which
+/// contain every MB the refresh can reach (it never looks above the slice's first row).
 pub(crate) fn mb_dcs_from_pixels<T: DcNum>(
-    f: &FrameBuf,
+    f: &[PlaneBand],
     mbx: usize,
     mby: usize,
     nplanes: usize,
     dc: &mut [[T; 16]; 4],
 ) {
-    for (p, plane) in f.planes.iter().enumerate().take(nplanes) {
+    for (p, plane) in f.iter().enumerate().take(nplanes) {
         if is_chroma(p) {
             for (k, d) in dc[p].iter_mut().enumerate().take(4) {
                 let x = 16 * mbx + 8 * (k & 1);
@@ -301,7 +319,7 @@ pub(crate) trait StoredMb {
 /// top-right (left edge only) and top neighbours whose type is not INTRA.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn refresh_neighbours<M: StoredMb>(
-    f: &FrameBuf,
+    f: &[PlaneBand],
     cur: &mut [M],
     prev: &mut [M],
     mbx: usize,
@@ -354,9 +372,12 @@ pub(crate) fn block_origin(p: usize, k: usize, mbx: usize, mby: usize) -> (usize
     }
 }
 
-/// Frame-level decoding context shared by both variants.
+/// Decoding context of one slice, shared by both variants.
 pub(crate) struct FrameCtx<'a> {
-    pub cur: &'a mut FrameBuf,
+    /// The slice's rows of the current frame, one band per plane (Y, C1, C2, A). A slice
+    /// writes only its own MB rows (SPEC §3.2) and reads only those and the reference, so the
+    /// slices of a frame can be decoded in parallel (see [`Decoder::decode`]).
+    pub cur: Vec<PlaneBand<'a>>,
     pub refr: Option<&'a FrameBuf>,
     pub keyframe: bool,
     pub frame_flags: u32,
@@ -372,20 +393,29 @@ pub(crate) struct FrameCtx<'a> {
     pub opts: DecoderOptions,
     /// Set by the slice decoders to the MB that failed.
     pub fail_mb: Option<(usize, usize)>,
-    /// Per-MB side information, raster order.
+    /// Per-MB side information of the slice's MB rows, raster order, from MB row `mb_row0`.
     pub mb_info: &'a mut [MbInfo],
-    /// Per-plane 8×8 block info for the loop filter (SPEC §4.10).
-    pub blocks: &'a mut [PlaneBlocks],
+    pub mb_row0: usize,
+    /// Per-plane 8×8 block info of the slice's rows, for the loop filter (SPEC §4.10).
+    pub blocks: Vec<BlocksBand<'a>>,
 }
 
 impl FrameCtx<'_> {
+    /// Stores the side information of MB (mbx, mby).
+    pub fn set_mb_info(&mut self, mbx: usize, mby: usize, info: MbInfo) {
+        let i = (mby - self.mb_row0) * self.mb_w + mbx;
+        if let Some(slot) = self.mb_info.get_mut(i) {
+            *slot = info;
+        }
+    }
+
     /// Copies the co-located MB from the reference for all planes: SKIP in the float variant
     /// (unchanged by SPEC draft 8, which was checked on the integer variant only; see
     /// [`FrameCtx::hidden_h16`]) and slice error concealment. The integer variant's SKIP uses
     /// [`FrameCtx::skip_mb`].
     pub fn copy_mb(&mut self, mbx: usize, mby: usize) -> Result<()> {
         let r = self.refr.ok_or(Error::MissingReference)?;
-        for (p, (dst, src)) in self.cur.planes.iter_mut().zip(r.planes.iter()).enumerate() {
+        for (p, (dst, src)) in self.cur.iter_mut().zip(r.planes.iter()).enumerate() {
             let n = if is_chroma(p) { 16 } else { 32 };
             copy_block(dst, n * mbx, n * mby, src, (n * mbx) as i64, (n * mby) as i64, n);
         }
@@ -398,7 +428,7 @@ impl FrameCtx<'_> {
     pub fn copy_mb_plane(&mut self, p: usize, mbx: usize, mby: usize) -> Result<()> {
         let r = self.refr.ok_or(Error::MissingReference)?;
         let n = if is_chroma(p) { 16 } else { 32 };
-        if let (Some(dst), Some(src)) = (self.cur.planes.get_mut(p), r.planes.get(p)) {
+        if let (Some(dst), Some(src)) = (self.cur.get_mut(p), r.planes.get(p)) {
             copy_block(dst, n * mbx, n * mby, src, (n * mbx) as i64, (n * mby) as i64, n);
         }
         Ok(())
@@ -442,7 +472,7 @@ impl FrameCtx<'_> {
             None => v,
         };
         for &p in planes {
-            let (Some(dst), Some(src)) = (self.cur.planes.get_mut(p), r.planes.get(p)) else {
+            let (Some(dst), Some(src)) = (self.cur.get_mut(p), r.planes.get(p)) else {
                 continue;
             };
             let chroma = is_chroma(p);
@@ -506,7 +536,7 @@ fn conceal(ctx: &mut FrameCtx, from: (usize, usize), end_row: usize) {
     let (mut x, mut y) = from;
     while y < end_row {
         if ctx.copy_mb(x, y).is_err() {
-            for (p, plane) in ctx.cur.planes.iter_mut().enumerate() {
+            for (p, plane) in ctx.cur.iter_mut().enumerate() {
                 let n = if is_chroma(p) { 16 } else { 32 };
                 for r in 0..n {
                     let i = plane.idx((n * x) as i64, (n * y + r) as i64);
@@ -522,9 +552,165 @@ fn conceal(ctx: &mut FrameCtx, from: (usize, usize), end_row: usize) {
     }
 }
 
+/// What every slice of a frame reads besides its own bits: the reference frame and the
+/// frame-level parameters.
+struct SliceShared<'a> {
+    refr: Option<&'a FrameBuf>,
+    keyframe: bool,
+    frame_flags: u32,
+    has_alpha: bool,
+    pic_w: i64,
+    pic_h: i64,
+    hidden_h16: Option<i64>,
+    mb_w: usize,
+    opts: DecoderOptions,
+    float: bool,
+}
+
+/// One slice to decode: where its bits start, and the parts of the frame it writes.
+struct SliceJob<'a> {
+    index: usize,
+    /// MB rows `[first, end)`.
+    rows: (usize, usize),
+    /// Positioned at the slice's first bit.
+    reader: BitReader<'a>,
+    end_byte: usize,
+    /// The slice's rows of each plane.
+    planes: Vec<PlaneBand<'a>>,
+    /// The slice's block rows of each plane's loop filter info.
+    blocks: Vec<BlocksBand<'a>>,
+    /// The slice's rows of the per-MB side information.
+    mb_info: &'a mut [MbInfo],
+}
+
+/// The per-slice MB row state of either variant (SPEC §4.1, §5.1).
+enum SliceState {
+    G(crate::g::SliceRows),
+    F(crate::f::SliceRows),
+}
+
+impl SliceState {
+    fn new(float: bool, mb_w: usize) -> SliceState {
+        if float {
+            SliceState::F(crate::f::SliceRows::new(mb_w))
+        } else {
+            SliceState::G(crate::g::SliceRows::new(mb_w))
+        }
+    }
+}
+
+/// Splits the frame into one [`SliceJob`] per slice. Slice 0 starts where `header` stopped
+/// (after the edge flag lists), slice i > 0 at byte `slice_end[i-1]` (SPEC §3.2 step 6). Slice
+/// boundaries are multiples of 32 luma rows, so every plane splits at whole MB rows.
+fn split_slices<'a>(
+    hdr: &PacketHeader,
+    header: &BitReader<'a>,
+    packet: &'a [u8],
+    cur: &'a mut FrameBuf,
+    blocks: &'a mut [PlaneBlocks],
+    mb_info: &'a mut [MbInfo],
+    mb_w: usize,
+) -> Result<Vec<SliceJob<'a>>> {
+    // Rows per MB row: in pixels 32 (luma, alpha) or 16 (chroma), in 8×8 blocks 4 or 2.
+    let ends = |chroma: bool, unit: usize| -> Vec<usize> {
+        let unit = if chroma { unit / 2 } else { unit };
+        hdr.slice_rows.iter().map(|&(_, r1)| r1 * unit).collect()
+    };
+    let mut planes: Vec<_> = (cur.planes.iter_mut().enumerate())
+        .map(|(p, plane)| plane.bands(&ends(is_chroma(p), 32)).into_iter())
+        .collect();
+    let mut block_bands: Vec<_> = (blocks.iter_mut().enumerate())
+        .map(|(p, b)| b.bands(&ends(is_chroma(p), 4)).into_iter())
+        .collect();
+    let mut info = mb_info;
+    let mut jobs = Vec::with_capacity(hdr.slice_rows.len());
+    for (i, &(r0, r1)) in hdr.slice_rows.iter().enumerate() {
+        let (mine, rest) = std::mem::take(&mut info).split_at_mut((r1 - r0) * mb_w);
+        info = rest;
+        let reader = if i == 0 {
+            header.clone()
+        } else {
+            let mut br = BitReader::new(packet);
+            br.seek_byte(hdr.slice_end[i - 1])?;
+            br
+        };
+        jobs.push(SliceJob {
+            index: i,
+            rows: (r0, r1),
+            reader,
+            end_byte: hdr.slice_end[i],
+            planes: planes
+                .iter_mut()
+                .map(|b| b.next().expect("one band per slice"))
+                .collect(),
+            blocks: block_bands
+                .iter_mut()
+                .map(|b| b.next().expect("one band per slice"))
+                .collect(),
+            mb_info: mine,
+        });
+    }
+    Ok(jobs)
+}
+
+/// Decodes one slice (SPEC §3.2 step 6), concealing the rest of it on failure if the options
+/// say so.
+fn run_slice(shared: &SliceShared, job: SliceJob, state: &mut SliceState) -> SliceReport {
+    let SliceJob {
+        index,
+        rows: (r0, r1),
+        mut reader,
+        end_byte,
+        planes,
+        blocks,
+        mb_info,
+    } = job;
+    let mut ctx = FrameCtx {
+        cur: planes,
+        refr: shared.refr,
+        keyframe: shared.keyframe,
+        frame_flags: shared.frame_flags,
+        has_alpha: shared.has_alpha,
+        pic_w: shared.pic_w,
+        pic_h: shared.pic_h,
+        hidden_h16: shared.hidden_h16,
+        mb_w: shared.mb_w,
+        opts: shared.opts,
+        fail_mb: None,
+        mb_info,
+        mb_row0: r0,
+        blocks,
+    };
+    // SPEC-QUESTION: the reference only warns when a slice over- or under-reads; we allow
+    // reading into the next slice but fail on reading past the packet end.
+    let start_bit = reader.position();
+    let res = match state {
+        SliceState::G(rows) => crate::g::decode_slice(&mut ctx, &mut reader, rows, r0, r1),
+        SliceState::F(rows) => crate::f::decode_slice(&mut ctx, &mut reader, rows, r0, r1),
+    };
+    let failure = res.err().map(|error| SliceFailure {
+        mb: ctx.fail_mb.unwrap_or((0, r0)),
+        bit: reader.position(),
+        error,
+    });
+    if let Some(f) = &failure {
+        if shared.opts.conceal_slice_errors {
+            conceal(&mut ctx, f.mb, r1);
+        }
+    }
+    SliceReport {
+        index,
+        mb_rows: (r0, r1),
+        start_bit,
+        end_byte,
+        consumed_bit: reader.position(),
+        failure,
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn mc_block(
-    dst: &mut Plane,
+    dst: &mut PlaneBand,
     src: &Plane,
     x: usize,
     y: usize,
@@ -582,6 +768,8 @@ pub struct Decoder {
     aligned_w: usize,
     aligned_h: usize,
     opts: DecoderOptions,
+    /// `opts.threads` resolved (at least 1).
+    threads: usize,
     reference: Option<FrameBuf>,
     spare: Option<FrameBuf>,
     reports: Vec<SliceReport>,
@@ -614,6 +802,7 @@ impl Decoder {
             aligned_w: ceil_to(width, 32) as usize,
             aligned_h: ceil_to(height, 32) as usize,
             opts: DecoderOptions::default(),
+            threads: DecoderOptions::default().resolved_threads(),
             reference: None,
             spare: None,
             reports: Vec::new(),
@@ -627,6 +816,7 @@ impl Decoder {
     /// Sets the options for unverified behaviours.
     pub fn set_options(&mut self, opts: DecoderOptions) {
         self.opts = opts;
+        self.threads = opts.resolved_threads();
     }
 
     /// True if the video has an alpha plane.
@@ -738,6 +928,14 @@ impl Decoder {
     }
 
     /// Decodes one video packet. `keyframe` comes from the frame index.
+    ///
+    /// The slices are decoded in parallel (see [`DecoderOptions::threads`]), except for
+    /// float-variant files with alpha. The result is the same as decoding them in order.
+    // SPEC-QUESTION: SPEC §5.1 leaves alpha out of the float variant's neighbour refresh, so an
+    // INTRA MB can predict alpha from the DC a SKIP or MOTION neighbour never wrote; in the
+    // first row of a slice that stale value comes from the previous slice (a sequential decoder
+    // keeps the row state across slices; a randomised test shows the parallel decode would
+    // differ). We decode those files sequentially. Whether such files exist is unknown.
     // SPEC-QUESTION: SPEC §2.2/§3 do not say what an empty (or shorter than the slice table)
     // video packet means; we report it as an error rather than repeating the previous frame.
     pub fn decode(&mut self, packet: &[u8], keyframe: bool) -> Result<VideoFrame> {
@@ -762,56 +960,72 @@ impl Decoder {
         for b in &mut self.blocks {
             b.reset();
         }
-        {
-            let mut ctx = FrameCtx {
-                cur: &mut cur,
-                refr: if keyframe { None } else { self.reference.as_ref() },
-                keyframe,
-                frame_flags: hdr.frame_flags,
-                has_alpha: self.has_alpha,
-                pic_w: self.width as i64,
-                pic_h: self.height as i64,
-                hidden_h16: (!is_float_revision(self.revision)).then(|| ceil_to(self.height as u32, 16) as i64),
-                mb_w: self.aligned_w / 32,
-                opts: self.opts,
-                fail_mb: None,
-                mb_info: &mut self.mb_info,
-                blocks: &mut self.blocks,
-            };
-            let float = is_float_revision(self.revision);
-            let mut gstate = crate::g::SliceRows::new(ctx.mb_w);
-            let mut fstate = crate::f::SliceRows::new(ctx.mb_w);
-            for (i, &(r0, r1)) in hdr.slice_rows.iter().enumerate() {
-                // SPEC-QUESTION: the reference only warns when a slice over- or under-reads; we
-                // allow reading into the next slice but fail on reading past the packet end.
-                let start_bit = br.position();
-                ctx.fail_mb = None;
-                let res = if float {
-                    crate::f::decode_slice(&mut ctx, &mut br, &mut fstate, r0, r1)
-                } else {
-                    crate::g::decode_slice(&mut ctx, &mut br, &mut gstate, r0, r1)
-                };
-                let failure = res.err().map(|error| SliceFailure {
-                    mb: ctx.fail_mb.unwrap_or((0, r0)),
-                    bit: br.position(),
-                    error,
-                });
-                self.reports.push(SliceReport {
-                    index: i,
-                    mb_rows: (r0, r1),
-                    start_bit,
-                    end_byte: hdr.slice_end[i],
-                    consumed_bit: br.position(),
-                    failure: failure.clone(),
-                });
-                if let Some(f) = failure {
-                    if !self.opts.conceal_slice_errors {
-                        return Err(f.error);
-                    }
-                    conceal(&mut ctx, f.mb, r1);
+        let shared = SliceShared {
+            refr: if keyframe { None } else { self.reference.as_ref() },
+            keyframe,
+            frame_flags: hdr.frame_flags,
+            has_alpha: self.has_alpha,
+            pic_w: self.width as i64,
+            pic_h: self.height as i64,
+            hidden_h16: (!is_float_revision(self.revision)).then(|| ceil_to(self.height as u32, 16) as i64),
+            mb_w: self.aligned_w / 32,
+            opts: self.opts,
+            float: is_float_revision(self.revision),
+        };
+        let jobs = split_slices(
+            &hdr,
+            &br,
+            packet,
+            &mut cur,
+            &mut self.blocks,
+            &mut self.mb_info,
+            shared.mb_w,
+        )?;
+        // SPEC §3.2 step 6 gives every slice's start up front, and each slice writes only its
+        // own MB rows (see `FrameCtx::cur`), so the slices can be decoded in any order. The
+        // one exception is the float variant with alpha: its neighbour refresh skips alpha
+        // (SPEC §5.1), so an INTRA MB in a slice's first row can predict alpha from a SKIP or
+        // MOTION neighbour's stale stored DC, which the sequential decoder carries over from the
+        // previous slice. Such files are decoded sequentially.
+        let threads = self.threads.min(jobs.len());
+        let reports = if threads <= 1 || (shared.float && self.has_alpha) {
+            let mut rows = SliceState::new(shared.float, shared.mb_w);
+            let mut reports = Vec::with_capacity(jobs.len());
+            for job in jobs {
+                let rep = run_slice(&shared, job, &mut rows);
+                let stop = rep.failure.is_some() && !self.opts.conceal_slice_errors;
+                reports.push(rep);
+                if stop {
+                    break;
                 }
-                br.align();
-                br.seek_byte(hdr.slice_end[i])?;
+            }
+            reports
+        } else {
+            // Every slice starts from a fresh state: SPEC §4.1 resets, at slice start, all the
+            // state its first row reads (q and vectors of the row above; `TOP_EDGE` makes the
+            // DCs and types above unavailable and keeps the neighbour refresh off that row).
+            // The DCs that SKIP and MOTION MBs (and RESIDUE MBs without chroma) leave stored are
+            // never read before the refresh recomputes them (SPEC §4.8), so whatever a
+            // sequential decoder carries over from the previous slice cannot change the output.
+            par_map(jobs, threads, |job| {
+                run_slice(&shared, job, &mut SliceState::new(shared.float, shared.mb_w))
+            })
+        };
+        self.reports = reports;
+        if !self.opts.conceal_slice_errors {
+            // As in a sequential decode: the first failing slice fails the frame, and the
+            // reports end with it.
+            if let Some(i) = self.reports.iter().position(|r| r.failure.is_some()) {
+                self.reports.truncate(i + 1);
+                // Slices after the failing one were not decoded sequentially; drop what the
+                // parallel decode stored for them.
+                let r1 = self.reports[i].mb_rows.1;
+                self.mb_info[r1 * shared.mb_w..].fill(MbInfo::default());
+                return Err(self.reports[i]
+                    .failure
+                    .as_ref()
+                    .map(|f| f.error.clone())
+                    .expect("failure"));
             }
         }
         // SPEC-QUESTION: SPEC §4.10 says it is unverified whether the float variant (revisions
@@ -824,6 +1038,7 @@ impl Decoder {
                 hdr.frame_flags,
                 hdr.row_flags.as_deref(),
                 hdr.col_flags.as_deref(),
+                self.threads,
             );
         }
         cur.extend_edges();
@@ -998,9 +1213,8 @@ mod tests {
         let run = |hidden_h16: Option<i64>| {
             let mut cur = FrameBuf::new(32, 64, false);
             let mut mb_info = vec![MbInfo::default(); 2];
-            let mut blocks = Vec::new();
             let mut ctx = FrameCtx {
-                cur: &mut cur,
+                cur: cur.planes.iter_mut().map(|p| p.band()).collect(),
                 refr: Some(&refr),
                 keyframe: false,
                 frame_flags: 0,
@@ -1012,9 +1226,11 @@ mod tests {
                 opts: DecoderOptions::default(),
                 fail_mb: None,
                 mb_info: &mut mb_info,
-                blocks: &mut blocks,
+                mb_row0: 0,
+                blocks: Vec::new(),
             };
             ctx.skip_mb(0, 1).unwrap();
+            drop(ctx);
             let col = |p: &Plane| (0..p.h).map(|y| p.data[p.idx(3, y as i64)]).collect::<Vec<u8>>();
             (col(&cur.planes[0]), col(&cur.planes[1]))
         };

@@ -337,7 +337,7 @@ fn decode_mb(
     rows.cur[mbx].ty = ty;
     if ty == INTRA {
         // No alpha in the float variant's refresh (SPEC §5.1).
-        refresh_neighbours(ctx.cur, &mut rows.cur, &mut rows.prev, mbx, mby, top_edge, 3);
+        refresh_neighbours(&ctx.cur, &mut rows.cur, &mut rows.prev, mbx, mby, top_edge, 3);
     }
     let zero = Mb::default();
     let l = if left_edge { zero } else { rows.cur[mbx - 1] };
@@ -391,13 +391,15 @@ fn decode_mb(
             }
         }
     }
-    if let Some(info) = ctx.mb_info.get_mut(mby * ctx.mb_w + mbx) {
-        *info = crate::video::MbInfo {
+    ctx.set_mb_info(
+        mbx,
+        mby,
+        crate::video::MbInfo {
             mb_type: ty,
             intra_q: 0,
             inter_q: 0,
-        };
-    }
+        },
+    );
     rows.cur[mbx] = me;
     Ok(())
 }
@@ -452,7 +454,7 @@ fn decode_plane(
         coef[0] = dck * 0.125;
         idct_float(&mut coef);
         let (x, y) = block_origin(p, k, mbx, mby);
-        if let Some(plane) = ctx.cur.planes.get_mut(p) {
+        if let Some(plane) = ctx.cur.get_mut(p) {
             write_float_block(plane, x, y, &coef, !intra);
         }
     }

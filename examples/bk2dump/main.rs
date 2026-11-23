@@ -18,6 +18,8 @@
 //!   frame; the failures are still printed.
 //! - `--report`: print per-slice bit accounting (where each slice ended vs. the slice table).
 //! - `--no-loop-filter`: switch the in-loop filter (SPEC §4.10) off, for debugging.
+//! - `--threads N`: decode with N threads (`DecoderOptions::threads`; default 0 = one per core,
+//!   1 = sequential). Prints the decode time per frame.
 //! - `--side FILE`: write per-frame side information (frame flags, edge flags, MB types and q)
 //!   as text, one block per frame, for analysis scripts.
 
@@ -43,10 +45,11 @@ struct Opts {
     report: bool,
     side: Option<String>,
     no_loop_filter: bool,
+    threads: usize,
 }
 
 const USAGE: &str = "usage: bk2dump <in.bk2> <out.y4m | -> [max_frames] [--png DIR] [--png-frames N,N,..] \
-                     [--crop X,Y,W,H] [--half] [--swap-uv] [--limited] [--keep-going] [--conceal] [--report] [--side FILE] [--no-loop-filter]";
+                     [--crop X,Y,W,H] [--half] [--swap-uv] [--limited] [--keep-going] [--conceal] [--report] [--side FILE] [--no-loop-filter] [--threads N]";
 
 fn parse_args() -> Result<Opts, String> {
     let mut o = Opts::default();
@@ -80,6 +83,7 @@ fn parse_args() -> Result<Opts, String> {
             "--report" => o.report = true,
             "--side" => o.side = Some(val()?),
             "--no-loop-filter" => o.no_loop_filter = true,
+            "--threads" => o.threads = val()?.parse().map_err(|_| "--threads needs a number".to_string())?,
             _ if a.starts_with("--") => return Err(format!("unknown option {a}")),
             _ => pos.push(a),
         }
@@ -229,6 +233,7 @@ fn run(o: &Opts) -> Result<(), Box<dyn std::error::Error>> {
     dec.set_options(bink2::DecoderOptions {
         conceal_slice_errors: o.conceal,
         disable_loop_filter: o.no_loop_filter,
+        threads: o.threads,
         ..Default::default()
     });
     let (mut slices_total, mut slices_sync) = (0usize, 0usize);
@@ -238,8 +243,11 @@ fn run(o: &Opts) -> Result<(), Box<dyn std::error::Error>> {
     };
     let n = file.num_frames().min(o.max_frames.unwrap_or(usize::MAX));
     let (mut ok, mut failed) = (0usize, 0usize);
+    let mut decode_time = std::time::Duration::ZERO;
     for i in 0..n {
+        let t0 = std::time::Instant::now();
         let res = file.frame(i).and_then(|pkt| dec.decode(pkt.video, pkt.keyframe));
+        decode_time += t0.elapsed();
         if let Some(sf) = side.as_mut() {
             let bits = |f: Option<&[bool]>| match f {
                 Some(f) => f.iter().map(|&b| if b { '1' } else { '0' }).collect::<String>(),
@@ -328,5 +336,10 @@ fn run(o: &Opts) -> Result<(), Box<dyn std::error::Error>> {
         sf.flush()?;
     }
     println!("decoded {ok} of {n} frames, {failed} failed; {slices_sync} of {slices_total} slices in sync");
+    println!(
+        "decode time: {:.1} ms total, {:.2} ms per frame",
+        decode_time.as_secs_f64() * 1e3,
+        decode_time.as_secs_f64() * 1e3 / n.max(1) as f64
+    );
     Ok(())
 }

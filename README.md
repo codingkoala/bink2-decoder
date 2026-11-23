@@ -12,7 +12,7 @@ cargo run --release --example bk2wav -- in.bk2 out.wav [track]
 
 `bk2dump` prints the header and writes YUV4MPEG2 (`C420jpeg`, alpha dropped).
 
-Integer-variant frames go through the in-loop filter of SPEC §4.10 (`DecoderOptions::disable_loop_filter` or `bk2dump --no-loop-filter` switch it off for debugging). Unverified spec behaviours are marked `SPEC-QUESTION` in the code. `Decoder::set_options` selects how out-of-picture motion vectors are handled.
+Integer-variant frames go through the in-loop filter of SPEC §4.10 (`DecoderOptions::disable_loop_filter` or `bk2dump --no-loop-filter` switch it off for debugging). Unverified spec behaviours are marked `SPEC-QUESTION` in the code. `Decoder::set_options` selects how out-of-picture motion vectors are handled, and `DecoderOptions::threads` how many threads decode the slices of a frame and run the loop filter (default: one per core; 1 = sequential; the output is the same).
 
 Audio: `AudioDecoder` (and `decode_track` for a whole track) decodes Bink Audio with the DCT codec, mono or stereo, versions 1 and 2, to interleaved 16-bit PCM. Version 2 at 48 kHz stereo was checked against RAD's own output: same sample count, 99.92 % of samples identical, none off by more than 1. The RDFT codec is not supported. `bk2wav` writes a track to a WAV file.
 
