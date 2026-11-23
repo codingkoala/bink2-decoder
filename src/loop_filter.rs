@@ -1,4 +1,4 @@
-//! In-loop filter (SPEC §4.10, draft 6): DC smoothing of flat intra blocks, then the vertical
+//! In-loop filter (SPEC §4.10, draft 6, with the pass 3 rule of draft 8): DC smoothing of flat intra blocks, then the vertical
 //! and horizontal 8×8 block edges.
 
 use crate::dsp::clip8;
@@ -242,18 +242,24 @@ pub(crate) fn horizontal_pass(p: &mut Plane, blocks: &PlaneBlocks, off: &dyn Fn(
     }
 }
 
-/// Runs the whole filter on a decoded frame (planes in coding order Y, C1, C2, A).
+/// Runs the whole filter on a decoded frame (planes in coding order Y, C1, C2, A). `height` is
+/// the visible picture height.
 pub(crate) fn filter_frame(
     f: &mut FrameBuf,
     blocks: &[PlaneBlocks],
+    height: usize,
     frame_flags: u32,
     row_flags: Option<&[bool]>,
     col_flags: Option<&[bool]>,
 ) {
     let thr = ((frame_flags & 0xFF) * 8) as i32;
     // A flag that is not coded is 0 (SPEC §3.2): the edge is filtered.
-    // SPEC-QUESTION: luma edges past the end of a list (coded width/height rounded to 32 but the
-    // list sized from the size rounded to 16) are treated as flag 0.
+    // SPEC §4.10 draft 8: horizontal edges at or below H16 = ceil_to(height, 16) are never
+    // filtered (luma 8·by >= H16, chroma 8·by >= H16/2), with or without edge flag lists. Those
+    // are exactly the row flag indices past the end of the list (§3.2 sizes it from H16), so
+    // a row index past the end no longer occurs for an edge that is filtered. The column list is
+    // sized from the 32-aligned width and covers every vertical edge.
+    let h16 = height.div_ceil(16) * 16;
     let flag = |l: Option<&[bool]>, i: usize| l.and_then(|l| l.get(i)).copied().unwrap_or(false);
     for (pi, (plane, pb)) in f.planes.iter_mut().zip(blocks).enumerate() {
         if pi == 3 {
@@ -272,7 +278,8 @@ pub(crate) fn filter_frame(
             vertical_pass(plane, pb, &off);
         }
         if frame_flags & 0x8000 == 0 {
-            let off = |by: usize| flag(row_flags, if chroma { 2 * by - 1 } else { by - 1 });
+            let limit = if chroma { h16 / 2 } else { h16 };
+            let off = |by: usize| 8 * by >= limit || flag(row_flags, if chroma { 2 * by - 1 } else { by - 1 });
             horizontal_pass(plane, pb, &off);
         }
     }
@@ -483,15 +490,15 @@ mod tests {
         blocks[0].set(1, 0, intra(1, 0));
         let orig = f.clone();
         // bit 14: no vertical edges
-        filter_frame(&mut f, &blocks, 0x4000, None, None);
+        filter_frame(&mut f, &blocks, 32, 0x4000, None, None);
         assert_eq!(f.planes[0].data, orig.planes[0].data);
         // lists in use but not coded (bit 16 clear): all flags 0 -> filtered
-        filter_frame(&mut f, &blocks, 0, None, None);
+        filter_frame(&mut f, &blocks, 32, 0, None, None);
         assert_eq!(f.planes[0].data[f.planes[0].idx(7, 0)], 25);
         assert_eq!(f.planes[0].data[f.planes[0].idx(8, 0)], 75);
         // column flag C[0] = 1 switches the luma edge at x = 8 off
         let mut g = orig.clone();
-        filter_frame(&mut g, &blocks, 0x18000, None, Some(&[true, false, false]));
+        filter_frame(&mut g, &blocks, 32, 0x18000, None, Some(&[true, false, false]));
         assert_eq!(g.planes[0].data, orig.planes[0].data);
     }
 
@@ -503,7 +510,7 @@ mod tests {
         blocks[0].set(1, 0, intra(3, 1016));
         let run = |flags: u32| {
             let mut f = FrameBuf::new(32, 32, false);
-            filter_frame(&mut f, &blocks, flags, None, None);
+            filter_frame(&mut f, &blocks, 32, flags, None, None);
             (0..16)
                 .map(|x| f.planes[0].data[f.planes[0].idx(x, 0)])
                 .collect::<Vec<u8>>()
@@ -524,5 +531,58 @@ mod tests {
         let edges = run(3);
         assert_eq!(edges[..14], smooth[..14]);
         assert_eq!(edges[14..], [127 - 16, 127 - 32]);
+    }
+    #[test]
+    fn horizontal_edges_at_or_below_h16_are_never_filtered() {
+        // 32×64 coded frame (two MB rows), visible height 40 -> H16 = 48. Luma edges at
+        // y = 8, 16, ..., 56; chroma (32×32) edges at y = 8, 16, 24 with limit H16/2 = 24.
+        let mut f = FrameBuf::new(32, 64, false);
+        let mut blocks: Vec<PlaneBlocks> = f.planes.iter().map(|p| PlaneBlocks::new(p.w / 8, p.h / 8)).collect();
+        // Every block intra s = 1; each 8-row band alternates 0 / 100 so every horizontal edge
+        // has a step.
+        for (pb, plane) in blocks.iter_mut().zip(f.planes.iter_mut()) {
+            for by in 0..pb.bh {
+                for bx in 0..pb.bw {
+                    pb.set(bx, by, intra(1, 0));
+                }
+            }
+            for y in 0..plane.h {
+                for x in 0..plane.w {
+                    let i = plane.idx(x as i64, y as i64);
+                    plane.data[i] = if (y / 8) % 2 == 1 { 100 } else { 0 };
+                }
+            }
+        }
+        let orig = f.clone();
+        // Vertical edges off (bit 14); row list present with every flag 0 (count H16/8 - 1 = 5).
+        let rows = [false; 5];
+        let mut a = orig.clone();
+        filter_frame(&mut a, &blocks, 40, 0x14000, Some(&rows), None);
+        // Same without lists (bit 16 clear): the rule is the same.
+        let mut b = orig.clone();
+        filter_frame(&mut b, &blocks, 40, 0x4000, None, None);
+        for g in [&a, &b] {
+            let (y, oy) = (&g.planes[0], &orig.planes[0]);
+            let px = |p: &Plane, row: usize| p.data[p.idx(4, row as i64)];
+            // the edge at y = 40 (< 48) is filtered
+            assert_ne!(px(y, 39), px(oy, 39));
+            assert_ne!(px(y, 40), px(oy, 40));
+            // the edges at y = 48 and 56 (>= 48) are not: the y = 40 edge reaches rows 38..41
+            // only, so rows 42..64 stay unchanged
+            for row in 42..64 {
+                assert_eq!(px(y, row), px(oy, row), "luma row {row}");
+            }
+            // chroma: edge at y = 16 (< 24) filtered, edge at y = 24 (>= 24) not
+            let (c, oc) = (&g.planes[1], &orig.planes[1]);
+            assert_ne!(px(c, 16), px(oc, 16));
+            for row in 18..32 {
+                assert_eq!(px(c, row), px(oc, row), "chroma row {row}");
+            }
+        }
+        // A height that is a multiple of 32 filters every edge of the coded frame.
+        let mut full = orig.clone();
+        filter_frame(&mut full, &blocks, 64, 0x4000, None, None);
+        let (y, oy) = (&full.planes[0], &orig.planes[0]);
+        assert_ne!(y.data[y.idx(4, 56)], oy.data[oy.idx(4, 56)]);
     }
 }
